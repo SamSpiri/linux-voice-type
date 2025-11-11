@@ -15,7 +15,7 @@ readonly AUDIO_INPUT='hw:2,0' # Use `arecord -l` to list available devices
 source "$HOME/.config/linux-voice-type"      # Ensure this file has restrictive permissions
 
 readonly PREFERRED_FORMATS=(S16_LE S24_LE S24_3LE S32_LE)
-readonly PREFERRED_RATES=(16000 44100 48000 32000)
+readonly PREFERRED_RATES=(22000 16000 44100 48000 32000)
 readonly PREFERRED_CHANNELS=(1 2)
 
 # FILE and PID will be set dynamically; shellcheck disable=SC2034 for sourced vars
@@ -125,8 +125,8 @@ probe_params() {
   local dump
   dump="$(timeout 0.1 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
   if [[ -z "$dump" ]]; then
-    echo "FORMAT=S16_LE RATE=16000 CHANNELS=1"
-    echo "FORMAT=S16_LE RATE=16000 CHANNELS=1" &>>"$LOGFILE"
+    echo "FORMAT=S16_LE RATE=22000 CHANNELS=1"
+    echo "FORMAT=S16_LE RATE=22000 CHANNELS=1" &>>"$LOGFILE"
     return
   fi
   local formats chans_line chans_list rate_line rate_lo rate_hi chosen_format chosen_rate chosen_channels
@@ -187,7 +187,7 @@ start_recording() {
 
 normalize_audio() {
   # Two-pass loudness + format normalization using ffmpeg loudnorm
-  # Result: 16 kHz, mono, s16, LUFS normalized around -23 LUFS (broadcast standard) unless overridden later.
+  # Result: 22 kHz, mono, s16, LUFS normalized around -23 LUFS (broadcast standard) unless overridden later.
   if command -v ffmpeg &>/dev/null && [[ -f "$FILE.wav" ]]; then
     echo "normalize_audio: starting two-pass loudnorm for $FILE.wav" &>>"$LOGFILE"
     local pass1_output pass1_json measured_I measured_LRA measured_TP measured_thresh offset
@@ -205,7 +205,7 @@ normalize_audio() {
       if [[ -n "$measured_I" && -n "$measured_LRA" && -n "$measured_TP" && -n "$measured_thresh" && -n "$offset" && "$measured_I" != "null" ]]; then
         echo "normalize_audio: pass1 metrics input_i=$measured_I input_lra=$measured_LRA input_tp=$measured_TP input_thresh=$measured_thresh offset=$offset" &>>"$LOGFILE"
         # Second pass: apply normalization with measured values; also enforce target format.
-        if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
+        if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" -ac 1 -ar 22000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
           mv "${FILE}-norm.wav" "$FILE.wav"
           echo "normalize_audio: two-pass loudnorm complete (file normalized)" &>>"$LOGFILE"
           return 0
@@ -219,7 +219,7 @@ normalize_audio() {
       echo "normalize_audio: loudnorm analysis produced no JSON; falling back" &>>"$LOGFILE"
     fi
     # Fallback: simple format conversion only
-    if ffmpeg -y -i "$FILE.wav" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
+    if ffmpeg -y -i "$FILE.wav" -ac 1 -ar 22000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
       mv "${FILE}-norm.wav" "$FILE.wav"
       echo "normalize_audio: fallback format normalization done" &>>"$LOGFILE"
     else
