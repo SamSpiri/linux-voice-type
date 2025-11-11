@@ -15,8 +15,10 @@ source "$HOME/.config/linux-voice-type"      # Ensure this file has restrictive 
 
 # Preference arrays for decision logic (recording and API conversion)
 # Order defines desirability; first match wins.
-readonly RECORD_FORMAT_PREF=(S32_LE S24_LE S24_3LE S24_32LE S16_LE)
-readonly API_FORMAT_PREF=(S24_LE S32_LE S16_LE)
+readonly RECORD_FORMAT_PREF=(S16_LE S32_LE S24_LE S24_3LE S24_32LE)
+readonly API_FORMAT_PREF=(S16_LE S24_LE S32_LE)
+readonly VOICE_TYPE_RECORD_RATE=22000
+readonly VOICE_TYPE_TARGET_RATE=22000
 
 # FILE and PID will be set dynamically; shellcheck disable=SC2034 for sourced vars
 FILE=""
@@ -143,14 +145,16 @@ probe_params() {
     if grep -qw "$f" <<<"$formats"; then chosen_format="$f"; break; fi
   done
   [[ -z $chosen_format ]] && chosen_format=$(awk '{print $1; exit}' <<<"$formats" || echo S16_LE)
-  # Rate: pick high end within typical speech range if available, else 44100
   if [[ -n ${rate_lo:-} && -n ${rate_hi:-} ]]; then
-    if (( rate_hi >= 48000 )); then chosen_rate=48000
-    elif (( rate_hi >= 44100 )); then chosen_rate=44100
-    else chosen_rate=$rate_hi
+    if (( rate_hi >= $VOICE_TYPE_RECORD_RATE )) && (( rate_lo <= $VOICE_TYPE_RECORD_RATE )); then
+      chosen_rate=$VOICE_TYPE_RECORD_RATE
+    elif (( rate_lo > $VOICE_TYPE_RECORD_RATE )); then
+      chosen_rate=$rate_lo
+    else
+      chosen_rate=$rate_hi
     fi
   else
-    chosen_rate=44100
+    chosen_rate=$VOICE_TYPE_RECORD_RATE
   fi
   # Channels: prefer mono (1) else first listed
   if grep -qw 1 <<<"$chans_list"; then chosen_channels=1; else chosen_channels=$(awk '{print $1; exit}' <<<"$chans_list" || echo 1); fi
@@ -192,6 +196,16 @@ choose_formats() {
   fi
 }
 
+# Map ALSA/arecord format tokens to ffmpeg audio codec names
+codec_for_format() {
+  case "$1" in
+    S16_LE) echo "pcm_s16le" ;;
+    S24_LE|S24_3LE|S24_32LE) echo "pcm_s24le" ;;
+    S32_LE) echo "pcm_s32le" ;;
+    *) echo "pcm_s16le" ;;
+  esac
+}
+
 start_recording() {
   ensure_state_dirs
   FILE="${HOME}/.local/var/voice-type/recording-$(date +%Y%m%d-%H%M%S)"
@@ -220,44 +234,64 @@ start_recording() {
 prepare_api_audio() {
   if ! command -v ffmpeg &>/dev/null; then echo "prepare_api_audio: ffmpeg not installed; using original recording" &>>"$LOGFILE"; return 0; fi
   if [[ ! -f "$FILE.wav" ]]; then echo "prepare_api_audio: source file missing ($FILE.wav)" &>>"$LOGFILE"; return 1; fi
-  local TARGET_FORMAT TARGET_SAMPLE_FMT TARGET_RATE TARGET_CHANNELS api_out
+  local TARGET_FORMAT TARGET_RATE TARGET_CHANNELS api_out TARGET_CODEC loudnorm_pass1 loudnorm_json measured_I measured_LRA measured_TP measured_thresh offset use_loudnorm
   TARGET_FORMAT="${API_FORMAT:-${RECORD_FORMAT:-S16_LE}}"
-  TARGET_RATE="${RATE:-44100}"
+  TARGET_RATE="${VOICE_TYPE_TARGET_RATE:-${RATE:-44100}}"
+  # Clamp overly high target rate unless explicitly forced
+  if [[ -z "${VOICE_TYPE_TARGET_RATE:-}" && "$TARGET_RATE" -gt 48000 ]]; then TARGET_RATE=48000; fi
   TARGET_CHANNELS="${CHANNELS:-1}"
+  TARGET_CODEC="$(codec_for_format "$TARGET_FORMAT")"
   api_out="${FILE}.api.wav"
-  case "$TARGET_FORMAT" in
-    S16_LE) TARGET_SAMPLE_FMT="s16" ;;
-    S24_LE|S24_3LE|S24_32LE) TARGET_SAMPLE_FMT="s24" ;;
-    S32_LE) TARGET_SAMPLE_FMT="s32" ;;
-    *) TARGET_SAMPLE_FMT="s16" ;;
-  esac
-  echo "prepare_api_audio: building API copy target_fmt=$TARGET_FORMAT ffmpeg_sample_fmt=$TARGET_SAMPLE_FMT rate=$TARGET_RATE ch=$TARGET_CHANNELS" &>>"$LOGFILE"
-  local pass1_output pass1_json measured_I measured_LRA measured_TP measured_thresh offset
-  pass1_output=$(ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af loudnorm=I=-23:LRA=7:TP=-2:print_format=json -f null - 2>&1 || true)
-  pass1_json=$(awk 'BEGIN{capture=0} /^\{/ {capture=1} capture {print} /^\}/ {if(capture){capture=0}}' <<<"$pass1_output")
-  if [[ -n "$pass1_json" ]]; then
-    measured_I=$(jq -r '.input_i' <<<"$pass1_json" 2>/dev/null || true)
-    measured_LRA=$(jq -r '.input_lra' <<<"$pass1_json" 2>/dev/null || true)
-    measured_TP=$(jq -r '.input_tp' <<<"$pass1_json" 2>/dev/null || true)
-    measured_thresh=$(jq -r '.input_thresh' <<<"$pass1_json" 2>/dev/null || true)
-    offset=$(jq -r '.target_offset' <<<"$pass1_json" 2>/dev/null || true)
-    if [[ -n "$measured_I" && "$measured_I" != "null" ]]; then
-      if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "$api_out" &>>"$LOGFILE" 2>&1; then
-        echo "prepare_api_audio: two-pass loudnorm complete -> $api_out" &>>"$LOGFILE"
+  use_loudnorm="${VOICE_TYPE_LOUDNORM:-1}"  # allow disabling
+  echo "prepare_api_audio: target_fmt=$TARGET_FORMAT codec=$TARGET_CODEC rate=$TARGET_RATE ch=$TARGET_CHANNELS loudnorm=$use_loudnorm" &>>"$LOGFILE"
+
+  if [[ "$use_loudnorm" == "1" ]]; then
+    loudnorm_pass1=$(ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af loudnorm=I=-23:LRA=7:TP=-2:print_format=json -f null - 2>&1 || true)
+    loudnorm_json=$(awk 'BEGIN{capture=0} /^\{/ {capture=1} capture {print} /^\}/ {if(capture){capture=0}}' <<<"$loudnorm_pass1")
+    if [[ -n "$loudnorm_json" ]]; then
+      measured_I=$(jq -r '.input_i' <<<"$loudnorm_json" 2>/dev/null || true)
+      measured_LRA=$(jq -r '.input_lra' <<<"$loudnorm_json" 2>/dev/null || true)
+      measured_TP=$(jq -r '.input_tp' <<<"$loudnorm_json" 2>/dev/null || true)
+      measured_thresh=$(jq -r '.input_thresh' <<<"$loudnorm_json" 2>/dev/null || true)
+      offset=$(jq -r '.target_offset' <<<"$loudnorm_json" 2>/dev/null || true)
+      if [[ -n "$measured_I" && "$measured_I" != "null" ]]; then
+        if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" \
+          -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" \
+          -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a "$TARGET_CODEC" "$api_out" &>>"$LOGFILE" 2>&1; then
+          echo "prepare_api_audio: two-pass loudnorm complete -> $api_out (I=$measured_I LRA=$measured_LRA TP=$measured_TP)" &>>"$LOGFILE"
+        else
+          echo "prepare_api_audio: loudnorm second pass failed; will try plain conversion" &>>"$LOGFILE"
+        fi
       else
-        echo "prepare_api_audio: loudnorm second pass failed; fallback conversion" &>>"$LOGFILE"
+        echo "prepare_api_audio: loudnorm metrics missing; skipping second pass" &>>"$LOGFILE"
+      fi
+    else
+      echo "prepare_api_audio: loudnorm analysis produced no JSON; skipping normalization" &>>"$LOGFILE"
+    fi
+  fi
+
+  if [[ ! -f "$api_out" ]]; then
+    if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a "$TARGET_CODEC" "$api_out" &>>"$LOGFILE" 2>&1; then
+      echo "prepare_api_audio: plain conversion done -> $api_out" &>>"$LOGFILE"
+    else
+      # Fallback: force S16_LE
+      echo "prepare_api_audio: conversion to $TARGET_CODEC failed; falling back to pcm_s16le" &>>"$LOGFILE"
+      if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a pcm_s16le "$api_out" &>>"$LOGFILE" 2>&1; then
+        echo "prepare_api_audio: fallback to pcm_s16le succeeded" &>>"$LOGFILE"
+        API_FORMAT="S16_LE"; TARGET_FORMAT="S16_LE"; TARGET_CODEC="pcm_s16le"
+      else
+        echo "prepare_api_audio: fallback conversion failed; using original" &>>"$LOGFILE"; return 1
       fi
     fi
   fi
-  if [[ ! -f "$api_out" ]]; then
-    if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "$api_out" &>>"$LOGFILE" 2>&1; then
-      echo "prepare_api_audio: fallback conversion done -> $api_out" &>>"$LOGFILE"
-    else
-      echo "prepare_api_audio: conversion failed; using original" &>>"$LOGFILE"; return 1
-    fi
+
+  # Optional loudness verification (ebur128) if requested
+  if [[ -f "$api_out" && "${VOICE_TYPE_VERIFY_LOUDNESS:-0}" == "1" ]]; then
+    ffmpeg -hide_banner -nostats -i "$api_out" -filter_complex ebur128 -f null - 2>&1 | awk '/I:/ {print "prepare_api_audio: post-normalization " $0}' &>>"$LOGFILE" || true
   fi
-  if [[ "${VOICE_TYPE_KEEP_ORIGINAL:-1}" == "0" ]]; then
-    mv "$api_out" "$FILE.wav" && echo "prepare_api_audio: replaced original with API copy (KEEP_ORIGINAL=0)" &>>"$LOGFILE"
+
+  if [[ "${VOICE_TYPE_KEEP_ORIGINAL:-1}" == "0" && -f "$api_out" ]]; then
+    mv "$api_out" "$FILE.wav" && echo "prepare_api_audio: replaced original with API copy (KEEP_ORIGINAL=0 final_codec=$TARGET_CODEC)" &>>"$LOGFILE"
   fi
 }
 
