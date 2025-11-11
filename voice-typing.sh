@@ -337,13 +337,11 @@ main() {
   ensure_state_dirs
   sanity_check
   if ! acquire_lock; then
-    # lock acquisition failure already notified; exit
     exit 1
   fi
-  # Ensure lock released no matter what
   trap release_lock EXIT
   if [[ -f "$SESSION_FILE" ]]; then
-    # Second invocation: load session, stop and transcribe
+    # Stop phase
     # shellcheck disable=SC1090
     source "$SESSION_FILE" || true
     if [[ -z "${FILE:-}" ]]; then
@@ -352,17 +350,25 @@ main() {
       notify "Voice typing error" "Session corrupt"
       exit 1
     fi
-    # ensure per-session logfile if FILE was set from session file
     LOGFILE="${FILE}.log"
+    # Fallback: if no process running AND no audio file, treat this invocation as a fresh start
+    if ! kill -0 "${PID:-0}" 2>/dev/null && [[ ! -f "${FILE}.wav" ]]; then
+      echo "Fallback: no arecord process and no audio file; starting new recording instead." &>>"$LOGFILE"
+      cleanup_session
+      # Start new recording under the same lock
+      start_recording
+      notify "Recording started" "Tigger again to stop"
+      return
+    fi
     stop_recording || true
     normalize_audio || true
     transcript || true
     output_transcript || true
     cleanup_session
   else
-    # First invocation: start new recording
+    # Start phase
     start_recording
-    notify "Recording started" "Run again to stop"
+    notify "Recording started" "Trigger again to stop"
   fi
 }
 
