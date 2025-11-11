@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # usage: exec ./voice-typing.sh twice to start and stop recording
 # Dependencies: curl, jq, arecord, xdotool, killall
+# Added: flock for locking concurrent invocations
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -8,6 +9,7 @@ IFS=$'\n\t'
 # Configuration
 # Session file holds variables across the two invocations (FILE path and recorder PID)
 readonly SESSION_FILE="${HOME}/.local/state/voice-type/session.env"
+readonly LOCK_FILE="${HOME}/.local/state/voice-type/lock"  # lock to serialize start/stop sequences
 readonly MAX_DURATION=3600
 readonly AUDIO_INPUT='hw:2,0' # Use `arecord -l` to list available devices
 source "$HOME/.config/linux-voice-type"      # Ensure this file has restrictive permissions
@@ -24,6 +26,9 @@ PID=""
 # default logfile before FILE is known; will be switched to $FILE.log after start_recording
 readonly DEFAULT_LOGFILE="${HOME}/.local/var/voice-type/voice-type.log"
 LOGFILE="$DEFAULT_LOGFILE"
+
+# Lock file FD (chosen high to avoid clashes); will be assigned in acquire_lock
+LOCK_FD=0
 
 # Send desktop notification if possible
 notify() {
@@ -43,6 +48,36 @@ ensure_state_dirs() {
   mkdir -p "${HOME}/.local/var/voice-type" || true
 }
 
+# Acquire a non-blocking lock; fail with notification if already locked
+acquire_lock() {
+  ensure_state_dirs
+  # shellcheck disable=SC3045 # using exec with FD assignment is intentional
+  exec {LOCK_FD}>"$LOCK_FILE" || {
+    echo "Failed to open lock file $LOCK_FILE" &>>"$LOGFILE"; return 1;
+  }
+  if ! flock -n "$LOCK_FD"; then
+    echo "Lock busy: another voice-typing operation in progress." &>>"$LOGFILE"
+    notify "Voice typing busy" "Another operation is in progress"
+    return 1
+  fi
+  # Record metadata in lock file (best-effort; not required for locking itself)
+  {
+    echo "PID=$$"; echo "TIME=$(date -Is)"; echo "ACTION_PENDING=$( [[ -f $SESSION_FILE ]] && echo stop || echo start )";
+  } >"$LOCK_FILE" 2>/dev/null || true
+  echo "acquire_lock: obtained lock (fd=$LOCK_FD action=$( [[ -f $SESSION_FILE ]] && echo stop || echo start ))" &>>"$LOGFILE"
+}
+
+release_lock() {
+  if (( LOCK_FD > 0 )); then
+    flock -u "$LOCK_FD" 2>/dev/null || true
+    # shellcheck disable=SC3045
+    exec {LOCK_FD}>&- 2>/dev/null || true
+    rm -f "$LOCK_FILE" 2>/dev/null || true
+    echo "release_lock: released lock" &>>"$LOGFILE"
+  fi
+}
+
+# Detect default device (PipeWire/Pulse or first ALSA card)
 detect_default_device() {
   if command -v wpctl &>/dev/null; then
     echo "default"
@@ -67,10 +102,11 @@ detect_default_device() {
 }
 
 sanity_check() {
-  for cmd in xdotool arecord killall jq curl timeout; do
+  for cmd in xdotool arecord killall jq curl timeout flock; do
     if ! command -v "$cmd" &>/dev/null; then
       echo >&2 "Error: command $cmd not found."
       echo "Error: command $cmd not found." &>>"$LOGFILE"
+      notify "Missing dependency" "$cmd not found"
       exit 1
     fi
   done
@@ -78,6 +114,7 @@ sanity_check() {
   if [[ -z "${DEEPGRAM_TOKEN:-}" && -z "${OPEN_AI_TOKEN:-}" ]]; then
     echo >&2 "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable."
     echo "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable." &>>"$LOGFILE"
+    notify "Voice typing error" "Missing API token"
     exit 1
   fi
   set -u
@@ -86,7 +123,7 @@ sanity_check() {
 probe_params() {
   local dev="$1"
   local dump
-  dump="$(timeout 1 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
+  dump="$(timeout 0.1 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
   if [[ -z "$dump" ]]; then
     echo "FORMAT=S16_LE RATE=16000 CHANNELS=1"
     echo "FORMAT=S16_LE RATE=16000 CHANNELS=1" &>>"$LOGFILE"
@@ -149,9 +186,47 @@ start_recording() {
 }
 
 normalize_audio() {
+  # Two-pass loudness + format normalization using ffmpeg loudnorm
+  # Result: 16 kHz, mono, s16, LUFS normalized around -23 LUFS (broadcast standard) unless overridden later.
   if command -v ffmpeg &>/dev/null && [[ -f "$FILE.wav" ]]; then
-    ffmpeg -y -i "$FILE.wav" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" && mv "${FILE}-norm.wav" "$FILE.wav"
-    echo "normalize_audio: normalized $FILE.wav to 16k mono s16" &>>"$LOGFILE"
+    echo "normalize_audio: starting two-pass loudnorm for $FILE.wav" &>>"$LOGFILE"
+    local pass1_output pass1_json measured_I measured_LRA measured_TP measured_thresh offset
+    # First pass: analyze loudness
+    pass1_output=$(ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af loudnorm=I=-23:LRA=7:TP=-2:print_format=json -f null - 2>&1 || true)
+    # Extract JSON object produced by loudnorm
+    pass1_json=$(awk 'BEGIN{capture=0} /^\{/ {capture=1} capture {print} /^\}/ {if(capture){capture=0}}' <<<"$pass1_output")
+    if [[ -n "$pass1_json" ]]; then
+      # Parse required measured values with jq (dependency already checked in sanity_check)
+      measured_I=$(jq -r '.input_i' <<<"$pass1_json" 2>/dev/null || true)
+      measured_LRA=$(jq -r '.input_lra' <<<"$pass1_json" 2>/dev/null || true)
+      measured_TP=$(jq -r '.input_tp' <<<"$pass1_json" 2>/dev/null || true)
+      measured_thresh=$(jq -r '.input_thresh' <<<"$pass1_json" 2>/dev/null || true)
+      offset=$(jq -r '.target_offset' <<<"$pass1_json" 2>/dev/null || true)
+      if [[ -n "$measured_I" && -n "$measured_LRA" && -n "$measured_TP" && -n "$measured_thresh" && -n "$offset" && "$measured_I" != "null" ]]; then
+        echo "normalize_audio: pass1 metrics input_i=$measured_I input_lra=$measured_LRA input_tp=$measured_TP input_thresh=$measured_thresh offset=$offset" &>>"$LOGFILE"
+        # Second pass: apply normalization with measured values; also enforce target format.
+        if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
+          mv "${FILE}-norm.wav" "$FILE.wav"
+          echo "normalize_audio: two-pass loudnorm complete (file normalized)" &>>"$LOGFILE"
+          return 0
+        else
+          echo "normalize_audio: second pass failed; falling back to simple format normalization" &>>"$LOGFILE"
+        fi
+      else
+        echo "normalize_audio: could not parse loudnorm JSON metrics; falling back" &>>"$LOGFILE"
+      fi
+    else
+      echo "normalize_audio: loudnorm analysis produced no JSON; falling back" &>>"$LOGFILE"
+    fi
+    # Fallback: simple format conversion only
+    if ffmpeg -y -i "$FILE.wav" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
+      mv "${FILE}-norm.wav" "$FILE.wav"
+      echo "normalize_audio: fallback format normalization done" &>>"$LOGFILE"
+    else
+      echo "normalize_audio: fallback ffmpeg resample failed" &>>"$LOGFILE"
+    fi
+  else
+    echo "normalize_audio: ffmpeg not available or file missing; skipping" &>>"$LOGFILE"
   fi
 }
 
@@ -261,6 +336,12 @@ cleanup_session() {
 main() {
   ensure_state_dirs
   sanity_check
+  if ! acquire_lock; then
+    # lock acquisition failure already notified; exit
+    exit 1
+  fi
+  # Ensure lock released no matter what
+  trap release_lock EXIT
   if [[ -f "$SESSION_FILE" ]]; then
     # Second invocation: load session, stop and transcribe
     # shellcheck disable=SC1090
@@ -268,6 +349,7 @@ main() {
     if [[ -z "${FILE:-}" ]]; then
       echo "Session file missing FILE variable; aborting." &>>"$LOGFILE"
       cleanup_session
+      notify "Voice typing error" "Session corrupt"
       exit 1
     fi
     # ensure per-session logfile if FILE was set from session file
@@ -280,6 +362,7 @@ main() {
   else
     # First invocation: start new recording
     start_recording
+    notify "Recording started" "Run again to stop"
   fi
 }
 
