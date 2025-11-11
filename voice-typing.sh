@@ -152,21 +152,32 @@ stop_recording() {
   if [ -s "$PID_FILE" ]; then
     local pid
     pid=$(<"$PID_FILE")
-    rm -f "$PID_FILE"
 
-    # If the PID isn't a running process, we're done.
-    if ! kill -0 "$pid" 2>/dev/null; then
-      echo "Process $pid not running."
+    # If process doesn't exist, remove stale pidfile and return
+    if [ ! -d "/proc/$pid" ]; then
+      echo "Process $pid not running (no /proc/$pid). Removing stale pidfile."
+      rm -f "$PID_FILE" || true
       return 0
     fi
 
-    # Try a polite termination first, then wait up to ~5s for it to exit.
+    # Try to verify it's the expected recorder (best-effort). If not, warn but continue.
+    if [ -r "/proc/$pid/cmdline" ]; then
+      local cmdline
+      cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      if [[ -n "$cmdline" && ! "$cmdline" =~ arecord ]]; then
+        echo "Note: PID $pid cmdline does not look like arecord: $cmdline"
+      fi
+    fi
+
+    # Send polite SIGTERM first
     kill "$pid" 2>/dev/null || true
+
+    # Wait up to ~5s for process to exit
     local waited=0
     local max_wait=50 # 50 * 0.1s = 5s
     while kill -0 "$pid" 2>/dev/null; do
       if (( waited >= max_wait )); then
-        echo "Process $pid did not exit after polite SIGTERM; sending SIGKILL..."
+        echo "Process $pid did not exit after SIGTERM; sending SIGKILL..."
         kill -9 "$pid" 2>/dev/null || true
         break
       fi
@@ -174,10 +185,20 @@ stop_recording() {
       ((waited++))
     done
 
-    # Final check
+    # If it still exists, attempt to stop by process name as a last resort
     if kill -0 "$pid" 2>/dev/null; then
-      echo "Failed to stop process $pid"
-      return 1
+      echo "Attempting killall arecord as a fallback..."
+      killall -q arecord || true
+      sleep 0.2
+    fi
+
+    # Final check - don't return non-zero to avoid aborting under set -e; just warn.
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "Warning: Failed to stop process $pid; will remove stale pidfile and continue."
+      rm -f "$PID_FILE" || true
+    else
+      echo "Stopped recording (pid $pid). Removing pidfile."
+      rm -f "$PID_FILE" || true
     fi
 
     return 0
@@ -231,7 +252,7 @@ main() {
   sanity_check
 
   if [[ -f "$PID_FILE" ]]; then
-    stop_recording
+    stop_recording || true
     transcript
     output_transcript
   else
