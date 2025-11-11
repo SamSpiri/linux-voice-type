@@ -14,7 +14,8 @@ readonly MAX_DURATION=3600
 readonly AUDIO_INPUT='hw:2,0' # Use `arecord -l` to list available devices
 source "$HOME/.config/linux-voice-type"      # Ensure this file has restrictive permissions
 
-readonly PREFERRED_FORMATS=(S16_LE S24_LE S24_3LE S32_LE)
+# Prefer higher bit-depth first: 24-bit (packed & 3-byte), then 32-bit, then 16-bit.
+readonly PREFERRED_FORMATS=(S24_LE S24_3LE S32_LE S16_LE)
 readonly PREFERRED_RATES=(22000 16000 44100 48000 32000)
 readonly PREFERRED_CHANNELS=(1 2)
 
@@ -125,8 +126,9 @@ probe_params() {
   local dump
   dump="$(timeout 0.1 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
   if [[ -z "$dump" ]]; then
-    echo "FORMAT=S16_LE RATE=22000 CHANNELS=1"
-    echo "FORMAT=S16_LE RATE=22000 CHANNELS=1" &>>"$LOGFILE"
+    # If hardware params cannot be probed, prefer high quality default (24-bit) then later code may still succeed or fail gracefully.
+    echo "FORMAT=S24_LE RATE=22000 CHANNELS=1"
+    echo "FORMAT=S24_LE RATE=22000 CHANNELS=1" &>>"$LOGFILE"
     return
   fi
   local formats chans_line chans_list rate_line rate_lo rate_hi chosen_format chosen_rate chosen_channels
@@ -165,9 +167,7 @@ probe_params() {
 
 start_recording() {
   ensure_state_dirs
-  # Pick a new timestamped file only for a new session
   FILE="${HOME}/.local/var/voice-type/recording-$(date +%Y%m%d-%H%M%S)"
-  # switch logging to the per-session logfile
   LOGFILE="${FILE}.log"
   local dev params FORMAT RATE CHANNELS
   dev=$(detect_default_device)
@@ -182,21 +182,39 @@ start_recording() {
   : > "$SESSION_FILE"
   echo "FILE=$FILE" >> "$SESSION_FILE"
   echo "PID=$PID" >> "$SESSION_FILE"
-  echo "Started session: FILE=$FILE PID=$PID" &>>"$LOGFILE"
+  # Persist audio parameters for later normalization/transcription.
+  echo "FORMAT=$FORMAT" >> "$SESSION_FILE"
+  echo "RATE=$RATE" >> "$SESSION_FILE"
+  echo "CHANNELS=$CHANNELS" >> "$SESSION_FILE"
+  echo "Started session: FILE=$FILE PID=$PID FORMAT=$FORMAT RATE=$RATE CHANNELS=$CHANNELS" &>>"$LOGFILE"
 }
 
 normalize_audio() {
-  # Two-pass loudness + format normalization using ffmpeg loudnorm
-  # Result: 22 kHz, mono, s16, LUFS normalized around -23 LUFS (broadcast standard) unless overridden later.
+  # Preserve original recording parameters (bit depth, rate, channels) instead of forcing 16-bit/22kHz.
   if command -v ffmpeg &>/dev/null && [[ -f "$FILE.wav" ]]; then
-    echo "normalize_audio: starting two-pass loudnorm for $FILE.wav" &>>"$LOGFILE"
+    # Derive target parameters from session (if available) else smart defaults.
+    local TARGET_FORMAT TARGET_SAMPLE_FMT TARGET_RATE TARGET_CHANNELS
+    TARGET_FORMAT="${FORMAT:-}"  # FORMAT should be set from session file.
+    TARGET_RATE="${RATE:-}"      # RATE should be set from session file.
+    TARGET_CHANNELS="${CHANNELS:-}"  # CHANNELS should be set from session file.
+
+    # Fallback defaults if session variables missing (old session before upgrade)
+    [[ -z "$TARGET_FORMAT" ]] && TARGET_FORMAT="S24_LE"
+    [[ -z "$TARGET_RATE" ]] && TARGET_RATE=22000
+    [[ -z "$TARGET_CHANNELS" ]] && TARGET_CHANNELS=1
+
+    case "$TARGET_FORMAT" in
+      S16_LE) TARGET_SAMPLE_FMT="s16" ;;
+      S24_LE|S24_3LE) TARGET_SAMPLE_FMT="s24" ;;
+      S32_LE) TARGET_SAMPLE_FMT="s32" ;;
+      *) TARGET_SAMPLE_FMT="s24" ;; # default preference
+    esac
+
+    echo "normalize_audio: starting two-pass loudnorm for $FILE.wav (fmt=$TARGET_FORMAT ffmpeg_sample_fmt=$TARGET_SAMPLE_FMT rate=$TARGET_RATE ch=$TARGET_CHANNELS)" &>>"$LOGFILE"
     local pass1_output pass1_json measured_I measured_LRA measured_TP measured_thresh offset
-    # First pass: analyze loudness
     pass1_output=$(ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af loudnorm=I=-23:LRA=7:TP=-2:print_format=json -f null - 2>&1 || true)
-    # Extract JSON object produced by loudnorm
     pass1_json=$(awk 'BEGIN{capture=0} /^\{/ {capture=1} capture {print} /^\}/ {if(capture){capture=0}}' <<<"$pass1_output")
     if [[ -n "$pass1_json" ]]; then
-      # Parse required measured values with jq (dependency already checked in sanity_check)
       measured_I=$(jq -r '.input_i' <<<"$pass1_json" 2>/dev/null || true)
       measured_LRA=$(jq -r '.input_lra' <<<"$pass1_json" 2>/dev/null || true)
       measured_TP=$(jq -r '.input_tp' <<<"$pass1_json" 2>/dev/null || true)
@@ -204,13 +222,12 @@ normalize_audio() {
       offset=$(jq -r '.target_offset' <<<"$pass1_json" 2>/dev/null || true)
       if [[ -n "$measured_I" && -n "$measured_LRA" && -n "$measured_TP" && -n "$measured_thresh" && -n "$offset" && "$measured_I" != "null" ]]; then
         echo "normalize_audio: pass1 metrics input_i=$measured_I input_lra=$measured_LRA input_tp=$measured_TP input_thresh=$measured_thresh offset=$offset" &>>"$LOGFILE"
-        # Second pass: apply normalization with measured values; also enforce target format.
-        if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" -ac 1 -ar 22000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
+        if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
           mv "${FILE}-norm.wav" "$FILE.wav"
-          echo "normalize_audio: two-pass loudnorm complete (file normalized)" &>>"$LOGFILE"
+          echo "normalize_audio: two-pass loudnorm complete (file normalized with preserved format/rate/channels)" &>>"$LOGFILE"
           return 0
         else
-          echo "normalize_audio: second pass failed; falling back to simple format normalization" &>>"$LOGFILE"
+          echo "normalize_audio: second pass failed; falling back to simple normalization" &>>"$LOGFILE"
         fi
       else
         echo "normalize_audio: could not parse loudnorm JSON metrics; falling back" &>>"$LOGFILE"
@@ -218,12 +235,12 @@ normalize_audio() {
     else
       echo "normalize_audio: loudnorm analysis produced no JSON; falling back" &>>"$LOGFILE"
     fi
-    # Fallback: simple format conversion only
-    if ffmpeg -y -i "$FILE.wav" -ac 1 -ar 22000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
+    # Fallback: basic format/rate/channel enforcement without loudness metrics
+    if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
       mv "${FILE}-norm.wav" "$FILE.wav"
-      echo "normalize_audio: fallback format normalization done" &>>"$LOGFILE"
+      echo "normalize_audio: fallback format preservation done (fmt=$TARGET_SAMPLE_FMT rate=$TARGET_RATE ch=$TARGET_CHANNELS)" &>>"$LOGFILE"
     else
-      echo "normalize_audio: fallback ffmpeg resample failed" &>>"$LOGFILE"
+      echo "normalize_audio: fallback ffmpeg conversion failed" &>>"$LOGFILE"
     fi
   else
     echo "normalize_audio: ffmpeg not available or file missing; skipping" &>>"$LOGFILE"
@@ -342,7 +359,6 @@ main() {
   trap release_lock EXIT
   if [[ -f "$SESSION_FILE" ]]; then
     # Stop phase
-    # shellcheck disable=SC1090
     source "$SESSION_FILE" || true
     if [[ -z "${FILE:-}" ]]; then
       echo "Session file missing FILE variable; aborting." &>>"$LOGFILE"
@@ -351,11 +367,9 @@ main() {
       exit 1
     fi
     LOGFILE="${FILE}.log"
-    # Fallback: if no process running AND no audio file, treat this invocation as a fresh start
     if ! kill -0 "${PID:-0}" 2>/dev/null && [[ ! -f "${FILE}.wav" ]]; then
       echo "Fallback: no arecord process and no audio file; starting new recording instead." &>>"$LOGFILE"
       cleanup_session
-      # Start new recording under the same lock
       start_recording
       notify "Recording started" "Tigger again to stop"
       return
@@ -366,7 +380,6 @@ main() {
     output_transcript || true
     cleanup_session
   else
-    # Start phase
     start_recording
     notify "Recording started" "Trigger again to stop"
   fi
