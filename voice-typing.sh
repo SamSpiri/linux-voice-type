@@ -38,45 +38,83 @@ detect_default_device() {
   echo "default"
 }
 
+# Add timeout to sanity_check list
+sanity_check() {
+  for cmd in xdotool arecord killall jq curl timeout; do
+    if ! command -v "$cmd" &>/dev/null; then
+      echo >&2 "Error: command $cmd not found."
+      exit 1
+    fi
+  done
+  set +u
+  if [[ -z "$DEEPGRAM_TOKEN" ]] && [[ -z "$OPEN_AI_TOKEN" ]]; then
+    echo >&2 "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable."
+    exit 1
+  fi
+  set -u
+}
+
+# Replace probe_params with non-hanging version
 probe_params() {
   local dev="$1"
+  # Use timeout + a 1s duration so arecord exits; ignore non-zero exit
   local dump
-  if ! dump="$(arecord -D "$dev" --dump-hw-params /dev/null 2>&1)"; then
+  dump="$(timeout 2 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
+  if [[ -z "$dump" ]]; then
     echo "FORMAT=S16_LE RATE=44100 CHANNELS=1"
     return
   fi
-  local formats rates chans
-  formats=$(awk '/FORMAT:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
-  rates=$(awk '/RATE:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
-  chans=$(awk '/CHANNELS:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
 
+  # Extract FORMAT tokens
+  local formats
+  formats=$(awk '/^FORMAT:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
+
+  # Extract CHANNELS range or list
+  local chans_line
+  chans_line=$(awk '/^CHANNELS:/ {print; exit}' <<<"$dump")
+  local chans_list
+  if [[ $chans_line =~ \[([0-9]+)[[:space:]]+([0-9]+)\] ]]; then
+    # Range: build a minimal list (1..2..N) for preference matching
+    chans_list="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+  else
+    chans_list=$(awk '/^CHANNELS:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
+  fi
+
+  # Extract RATE range
+  local rate_line
+  rate_line=$(awk '/^RATE:/ {print; exit}' <<<"$dump")
+  local rate_lo rate_hi
+  if [[ $rate_line =~ \[([0-9]+)[[:space:]]+([0-9]+)\] ]]; then
+    rate_lo="${BASH_REMATCH[1]}"
+    rate_hi="${BASH_REMATCH[2]}"
+  fi
+
+  # Choose format
   local chosen_format=""
   for f in "${PREFERRED_FORMATS[@]}"; do
-    if grep -q "$f" <<<"$formats"; then chosen_format="$f"; break; fi
+    if grep -qw "$f" <<<"$formats"; then chosen_format="$f"; break; fi
   done
-  [[ -z $chosen_format ]] && chosen_format=$(head -n1 <<<"$formats")
+  [[ -z $chosen_format ]] && chosen_format=$(head -n1 <<<"$formats" || echo S16_LE)
 
-  # Rate lines may be ranges like 8000-48000; pick first preferred inside any range or exact match.
+  # Choose rate
   local chosen_rate=""
-  for r in "${PREFERRED_RATES[@]}"; do
-    if grep -qw "$r" <<<"$rates"; then chosen_rate="$r"; break
-    elif grep -Eq "([0-9]+)-([0-9]+)" <<<"$rates"; then
-      local lo hi
-      lo=$(grep -Eo '([0-9]+)-([0-9]+)' <<<"$rates" | head -n1 | cut -d- -f1)
-      hi=$(grep -Eo '([0-9]+)-([0-9]+)' <<<"$rates" | head -n1 | cut -d- -f2)
-      if (( r >= lo && r <= hi )); then chosen_rate="$r"; break; fi
-    fi
-  done
-  [[ -z $chosen_rate ]] && chosen_rate=$(grep -Eo '^[0-9]+' <<<"$rates" | head -n1 || echo 44100)
+  if [[ -n $rate_lo && -n $rate_hi ]]; then
+    for r in "${PREFERRED_RATES[@]}"; do
+      if (( r >= rate_lo && r <= rate_hi )); then chosen_rate="$r"; break; fi
+    done
+  fi
+  [[ -z $chosen_rate ]] && chosen_rate=44100
 
+  # Choose channels
   local chosen_channels=""
   for c in "${PREFERRED_CHANNELS[@]}"; do
-    if grep -qw "$c" <<<"$chans"; then chosen_channels="$c"; break; fi
+    if grep -qw "$c" <<<"$chans_list"; then chosen_channels="$c"; break; fi
   done
-  [[ -z $chosen_channels ]] && chosen_channels=$(head -n1 <<<"$chans" || echo 1)
+  [[ -z $chosen_channels ]] && chosen_channels=1
 
   echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels"
 }
+
 
 start_recording() {
   mkdir -p "$(dirname "$FILE")"
@@ -87,15 +125,15 @@ start_recording() {
   eval "$params"   # sets FORMAT RATE CHANNELS
   echo "Recording from device '$dev' format=$FORMAT rate=$RATE channels=$CHANNELS"
   set -x
-  nohup arecord -D "$dev" -f "$FORMAT" -r "$RATE" -c "$CHANNELS" "$FILE.wav" --duration="$MAX_DURATION" &>/dev/null &
-  set +x
+  nohup arecord -D "$dev" -f "$FORMAT" -r "$RATE" -c "$CHANNELS" "$FILE.wav" --duration="$MAX_DURATION" &>>$FILE.arecord.log &
   echo $! >"$PID_FILE"
+  set +x
 }
 
 # Optional post-processing (call before transcription) to normalize for Whisper:
 normalize_audio() {
   if command -v ffmpeg &>/dev/null; then
-    ffmpeg -y -i "$FILE.wav" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>/dev/null && mv "${FILE}-norm.wav" "$FILE.wav"
+    ffmpeg -y -i "$FILE.wav" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>>$FILE.log && mv "${FILE}-norm.wav" "$FILE.wav"
   fi
 }
 
@@ -115,7 +153,33 @@ stop_recording() {
     local pid
     pid=$(<"$PID_FILE")
     rm -f "$PID_FILE"
-    kill "$pid" && wait "$pid" 2>/dev/null || killall -w arecord
+
+    # If the PID isn't a running process, we're done.
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "Process $pid not running."
+      return 0
+    fi
+
+    # Try a polite termination first, then wait up to ~5s for it to exit.
+    kill "$pid" 2>/dev/null || true
+    local waited=0
+    local max_wait=50 # 50 * 0.1s = 5s
+    while kill -0 "$pid" 2>/dev/null; do
+      if (( waited >= max_wait )); then
+        echo "Process $pid did not exit after polite SIGTERM; sending SIGKILL..."
+        kill -9 "$pid" 2>/dev/null || true
+        break
+      fi
+      sleep 0.1
+      ((waited++))
+    done
+
+    # Final check
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "Failed to stop process $pid"
+      return 1
+    fi
+
     return 0
   fi
   echo "No recording process found."
@@ -125,7 +189,7 @@ stop_recording() {
 output_transcript() {
   perl -pi -e 'chomp if eof' "$FILE.txt"
   #xdotool type --clearmodifiers --file "$FILE.txt"
-  xclip -selection clipboard < "$FILE.txt"
+  xclip -selection clipboard < "$FILE.txt" &>>$FILE.log
 }
 
 transcribe_with_openai() {
@@ -133,23 +197,23 @@ transcribe_with_openai() {
     echo "Audio file not found: $FILE.wav"
     exit 1
   fi
-  curl --silent --fail --request POST \
+  curl --fail --request POST \
     --url https://api.openai.com/v1/audio/transcriptions \
     --header "Authorization: Bearer $OPEN_AI_TOKEN" \
     --header 'Content-Type: multipart/form-data' \
     --form file="@$FILE.wav" \
     --form model=whisper-1 \
     --form response_format=text \
-    -o "${FILE}.txt"
+    -o "${FILE}.txt" &>>$FILE.log
 }
 
 transcribe_with_deepgram() {
-  curl --silent --fail --request POST \
+  curl --fail --request POST \
     --url 'https://api.deepgram.com/v1/listen?smart_format=true' \
     --header "Authorization: Token $DEEPGRAM_TOKEN" \
     --header 'Content-Type: audio/wav' \
     --data-binary "@$FILE.wav" \
-    -o "${FILE}.json"
+    -o "${FILE}.json" &>>$FILE.log
   jq '.results.channels[0].alternatives[0].transcript' -r "${FILE}.json" >"${FILE}.txt"
 }
 
@@ -159,21 +223,6 @@ transcript() {
     transcribe_with_openai
   else
     transcribe_with_deepgram
-  fi
-  set -u
-}
-
-sanity_check() {
-  for cmd in xdotool arecord killall jq curl; do
-    if ! command -v "$cmd" &>/dev/null; then
-      echo >&2 "Error: command $cmd not found."
-      exit 1
-    fi
-  done
-  set +u
-  if [[ -z "$DEEPGRAM_TOKEN" ]] && [[ -z "$OPEN_AI_TOKEN" ]]; then
-    echo >&2 "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable."
-    exit 1
   fi
   set -u
 }
