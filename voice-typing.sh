@@ -16,8 +16,9 @@ source "$HOME/.config/linux-voice-type"      # Ensure this file has restrictive 
 
 # Prefer higher bit-depth first: 24-bit (packed & 3-byte), then 32-bit, then 16-bit.
 readonly PREFERRED_FORMATS=(S24_LE S24_3LE S32_LE S16_LE)
-readonly PREFERRED_RATES=(22000 16000 44100 48000 32000)
-readonly PREFERRED_CHANNELS=(1 2)
+# New preference arrays for decision logic
+readonly RECORD_FORMAT_PREF=(S32_LE S24_LE S24_3LE S24_32LE S16_LE)
+readonly API_FORMAT_PREF=(S24_LE S32_LE S16_LE)
 
 # FILE and PID will be set dynamically; shellcheck disable=SC2034 for sourced vars
 # (They are intentionally global for subsequent function calls.)
@@ -126,13 +127,13 @@ probe_params() {
   local dump
   dump="$(timeout 0.1 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
   if [[ -z "$dump" ]]; then
-    # If hardware params cannot be probed, prefer high quality default (24-bit) then later code may still succeed or fail gracefully.
-    echo "FORMAT=S24_LE RATE=22000 CHANNELS=1"
-    echo "FORMAT=S24_LE RATE=22000 CHANNELS=1" &>>"$LOGFILE"
+    echo "FORMAT=S24_LE RATE=22000 CHANNELS=1 RAW_FORMATS='S24_LE S16_LE'"
+    echo "FORMAT=S24_LE RATE=22000 CHANNELS=1 RAW_FORMATS='S24_LE S16_LE'" &>>"$LOGFILE"
     return
   fi
   local formats chans_line chans_list rate_line rate_lo rate_hi chosen_format chosen_rate chosen_channels
-  formats=$(awk '/^FORMAT:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
+  formats=$(awk '/^FORMAT:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump" | tr '\n' ' ')
+  # capture packed/container variants that may appear (S24_3LE, S24_32LE)
   chans_line=$(awk '/^CHANNELS:/ {print; exit}' <<<"$dump")
   if [[ $chans_line =~ \[([0-9]+)[[:space:]]+([0-9]+)\] ]]; then
     chans_list="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
@@ -147,7 +148,7 @@ probe_params() {
   for f in "${PREFERRED_FORMATS[@]}"; do
     if grep -qw "$f" <<<"$formats"; then chosen_format="$f"; break; fi
   done
-  [[ -z $chosen_format ]] && chosen_format=$(head -n1 <<<"$formats" || echo S16_LE)
+  [[ -z $chosen_format ]] && chosen_format=$(awk '{print $1; exit}' <<<"$formats" || echo S16_LE)
   chosen_rate=""
   if [[ -n ${rate_lo:-} && -n ${rate_hi:-} ]]; then
     for r in "${PREFERRED_RATES[@]}"; do
@@ -160,165 +161,155 @@ probe_params() {
     if grep -qw "$c" <<<"$chans_list"; then chosen_channels="$c"; break; fi
   done
   [[ -z $chosen_channels ]] && chosen_channels=1
-  # Print to stdout for callers (e.g. params=$(probe_params ...)) and also append to the logfile
-  echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels"
-  echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels" &>>"$LOGFILE"
+  echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels RAW_FORMATS='$formats'"
+  echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels RAW_FORMATS='$formats'" &>>"$LOGFILE"
+}
+
+choose_formats() {
+  # Inputs: RAW_FORMATS space separated list; optional env overrides.
+  local available="$RAW_FORMATS" f record api
+  # Apply override if valid
+  if [[ -n "${VOICE_TYPE_FORCE_RECORD_FORMAT:-}" && $available =~ (^|[[:space:]])${VOICE_TYPE_FORCE_RECORD_FORMAT}( |$) ]]; then
+    record="$VOICE_TYPE_FORCE_RECORD_FORMAT"
+  else
+    for f in "${RECORD_FORMAT_PREF[@]}"; do
+      if grep -qw "$f" <<<"$available"; then record="$f"; break; fi
+    done
+  fi
+  [[ -z $record ]] && record="S16_LE" # conservative fallback
+  if [[ -n "${VOICE_TYPE_FORCE_API_FORMAT:-}" ]]; then
+    api="$VOICE_TYPE_FORCE_API_FORMAT"
+  else
+    # Derive API format from record if acceptable
+    case "$record" in
+      S24_LE|S24_3LE|S24_32LE) api="S24_LE" ;;
+      S32_LE) api="S32_LE" ;;
+      S16_LE) api="S16_LE" ;;
+      *) api="S16_LE" ;;
+    esac
+    # If api not in acceptable list, iterate preferences
+    if ! [[ " ${API_FORMAT_PREF[*]} " =~ " $api " ]]; then
+      for f in "${API_FORMAT_PREF[@]}"; do
+        if grep -qw "$f" <<<"$available"; then api="$f"; break; fi
+      done
+    fi
+  fi
+  # Final fallback
+  [[ -z $api ]] && api="S16_LE"
+  RECORD_FORMAT="$record"
+  API_FORMAT="$api"
+  FORMAT="$RECORD_FORMAT" # backward compatibility alias
+  if [[ "${VOICE_TYPE_LOG_VERBOSE:-0}" == "1" ]]; then
+    echo "choose_formats: available=[$available] record=$RECORD_FORMAT api=$API_FORMAT overrides(rec=${VOICE_TYPE_FORCE_RECORD_FORMAT:-none},api=${VOICE_TYPE_FORCE_API_FORMAT:-none})" &>>"$LOGFILE"
+  fi
 }
 
 start_recording() {
   ensure_state_dirs
   FILE="${HOME}/.local/var/voice-type/recording-$(date +%Y%m%d-%H%M%S)"
   LOGFILE="${FILE}.log"
-  local dev params FORMAT RATE CHANNELS
+  local dev params FORMAT RATE CHANNELS RAW_FORMATS
   dev=$(detect_default_device)
   params=$(probe_params "$dev")
-  eval "$params"  # sets FORMAT RATE CHANNELS
-  echo "Recording from device '$dev' format=$FORMAT rate=$RATE channels=$CHANNELS" &>>"$LOGFILE"
+  eval "$params"  # sets FORMAT RATE CHANNELS RAW_FORMATS
+  choose_formats
+  echo "Recording from device '$dev' record_format=$RECORD_FORMAT api_format=$API_FORMAT rate=$RATE channels=$CHANNELS" &>>"$LOGFILE"
   set -x
-  nohup arecord -D "$dev" -f "$FORMAT" -r "$RATE" -c "$CHANNELS" "$FILE.wav" --duration="$MAX_DURATION" &>>"$FILE.arecord.log" &
+  nohup arecord -D "$dev" -f "$RECORD_FORMAT" -r "$RATE" -c "$CHANNELS" "$FILE.wav" --duration="$MAX_DURATION" &>>"$FILE.arecord.log" &
   PID=$!
   set +x
   # Initialize / append to session file
   : > "$SESSION_FILE"
   echo "FILE=$FILE" >> "$SESSION_FILE"
   echo "PID=$PID" >> "$SESSION_FILE"
-  # Persist audio parameters for later normalization/transcription.
-  echo "FORMAT=$FORMAT" >> "$SESSION_FILE"
+  echo "RECORD_FORMAT=$RECORD_FORMAT" >> "$SESSION_FILE"
+  echo "API_FORMAT=$API_FORMAT" >> "$SESSION_FILE"
   echo "RATE=$RATE" >> "$SESSION_FILE"
   echo "CHANNELS=$CHANNELS" >> "$SESSION_FILE"
-  echo "Started session: FILE=$FILE PID=$PID FORMAT=$FORMAT RATE=$RATE CHANNELS=$CHANNELS" &>>"$LOGFILE"
+  echo "RAW_FORMATS='$RAW_FORMATS'" >> "$SESSION_FILE"
+  echo "Started session: FILE=$FILE PID=$PID RECORD_FORMAT=$RECORD_FORMAT API_FORMAT=$API_FORMAT RATE=$RATE CHANNELS=$CHANNELS" &>>"$LOGFILE"
 }
 
-normalize_audio() {
-  # Preserve original recording parameters (bit depth, rate, channels) instead of forcing 16-bit/22kHz.
-  if command -v ffmpeg &>/dev/null && [[ -f "$FILE.wav" ]]; then
-    # Derive target parameters from session (if available) else smart defaults.
-    local TARGET_FORMAT TARGET_SAMPLE_FMT TARGET_RATE TARGET_CHANNELS
-    TARGET_FORMAT="${FORMAT:-}"  # FORMAT should be set from session file.
-    TARGET_RATE="${RATE:-}"      # RATE should be set from session file.
-    TARGET_CHANNELS="${CHANNELS:-}"  # CHANNELS should be set from session file.
-
-    # Fallback defaults if session variables missing (old session before upgrade)
-    [[ -z "$TARGET_FORMAT" ]] && TARGET_FORMAT="S24_LE"
-    [[ -z "$TARGET_RATE" ]] && TARGET_RATE=22000
-    [[ -z "$TARGET_CHANNELS" ]] && TARGET_CHANNELS=1
-
-    case "$TARGET_FORMAT" in
-      S16_LE) TARGET_SAMPLE_FMT="s16" ;;
-      S24_LE|S24_3LE) TARGET_SAMPLE_FMT="s24" ;;
-      S32_LE) TARGET_SAMPLE_FMT="s32" ;;
-      *) TARGET_SAMPLE_FMT="s24" ;; # default preference
-    esac
-
-    echo "normalize_audio: starting two-pass loudnorm for $FILE.wav (fmt=$TARGET_FORMAT ffmpeg_sample_fmt=$TARGET_SAMPLE_FMT rate=$TARGET_RATE ch=$TARGET_CHANNELS)" &>>"$LOGFILE"
-    local pass1_output pass1_json measured_I measured_LRA measured_TP measured_thresh offset
-    pass1_output=$(ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af loudnorm=I=-23:LRA=7:TP=-2:print_format=json -f null - 2>&1 || true)
-    pass1_json=$(awk 'BEGIN{capture=0} /^\{/ {capture=1} capture {print} /^\}/ {if(capture){capture=0}}' <<<"$pass1_output")
-    if [[ -n "$pass1_json" ]]; then
-      measured_I=$(jq -r '.input_i' <<<"$pass1_json" 2>/dev/null || true)
-      measured_LRA=$(jq -r '.input_lra' <<<"$pass1_json" 2>/dev/null || true)
-      measured_TP=$(jq -r '.input_tp' <<<"$pass1_json" 2>/dev/null || true)
-      measured_thresh=$(jq -r '.input_thresh' <<<"$pass1_json" 2>/dev/null || true)
-      offset=$(jq -r '.target_offset' <<<"$pass1_json" 2>/dev/null || true)
-      if [[ -n "$measured_I" && -n "$measured_LRA" && -n "$measured_TP" && -n "$measured_thresh" && -n "$offset" && "$measured_I" != "null" ]]; then
-        echo "normalize_audio: pass1 metrics input_i=$measured_I input_lra=$measured_LRA input_tp=$measured_TP input_thresh=$measured_thresh offset=$offset" &>>"$LOGFILE"
-        if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
-          mv "${FILE}-norm.wav" "$FILE.wav"
-          echo "normalize_audio: two-pass loudnorm complete (file normalized with preserved format/rate/channels)" &>>"$LOGFILE"
-          return 0
-        else
-          echo "normalize_audio: second pass failed; falling back to simple normalization" &>>"$LOGFILE"
-        fi
+prepare_api_audio() {
+  # Create or refresh API copy (FILE.api.wav) preserving API_FORMAT and applying loudnorm.
+  if ! command -v ffmpeg &>/dev/null; then
+    echo "prepare_api_audio: ffmpeg not installed; using original recording" &>>"$LOGFILE"
+    return 0
+  fi
+  if [[ ! -f "$FILE.wav" ]]; then
+    echo "prepare_api_audio: source file missing ($FILE.wav)" &>>"$LOGFILE"
+    return 1
+  fi
+  local TARGET_FORMAT TARGET_SAMPLE_FMT TARGET_RATE TARGET_CHANNELS api_out
+  TARGET_FORMAT="${API_FORMAT:-${RECORD_FORMAT:-S16_LE}}"
+  TARGET_RATE="${RATE:-44100}"
+  TARGET_CHANNELS="${CHANNELS:-1}"
+  api_out="${FILE}.api.wav"
+  case "$TARGET_FORMAT" in
+    S16_LE) TARGET_SAMPLE_FMT="s16" ;;
+    S24_LE|S24_3LE|S24_32LE) TARGET_SAMPLE_FMT="s24" ;;
+    S32_LE) TARGET_SAMPLE_FMT="s32" ;;
+    *) TARGET_SAMPLE_FMT="s16" ;;
+  esac
+  echo "prepare_api_audio: building API copy target_fmt=$TARGET_FORMAT ffmpeg_sample_fmt=$TARGET_SAMPLE_FMT rate=$TARGET_RATE ch=$TARGET_CHANNELS" &>>"$LOGFILE"
+  local pass1_output pass1_json measured_I measured_LRA measured_TP measured_thresh offset
+  pass1_output=$(ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af loudnorm=I=-23:LRA=7:TP=-2:print_format=json -f null - 2>&1 || true)
+  pass1_json=$(awk 'BEGIN{capture=0} /^\{/ {capture=1} capture {print} /^\}/ {if(capture){capture=0}}' <<<"$pass1_output")
+  if [[ -n "$pass1_json" ]]; then
+    measured_I=$(jq -r '.input_i' <<<"$pass1_json" 2>/dev/null || true)
+    measured_LRA=$(jq -r '.input_lra' <<<"$pass1_json" 2>/dev/null || true)
+    measured_TP=$(jq -r '.input_tp' <<<"$pass1_json" 2>/dev/null || true)
+    measured_thresh=$(jq -r '.input_thresh' <<<"$pass1_json" 2>/dev/null || true)
+    offset=$(jq -r '.target_offset' <<<"$pass1_json" 2>/dev/null || true)
+    if [[ -n "$measured_I" && "$measured_I" != "null" ]]; then
+      if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "$api_out" &>>"$LOGFILE" 2>&1; then
+        echo "prepare_api_audio: two-pass loudnorm complete -> $api_out" &>>"$LOGFILE"
       else
-        echo "normalize_audio: could not parse loudnorm JSON metrics; falling back" &>>"$LOGFILE"
+        echo "prepare_api_audio: loudnorm second pass failed; fallback conversion" &>>"$LOGFILE"
       fi
-    else
-      echo "normalize_audio: loudnorm analysis produced no JSON; falling back" &>>"$LOGFILE"
     fi
-    # Fallback: basic format/rate/channel enforcement without loudness metrics
-    if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "${FILE}-norm.wav" &>>"$LOGFILE" 2>&1; then
-      mv "${FILE}-norm.wav" "$FILE.wav"
-      echo "normalize_audio: fallback format preservation done (fmt=$TARGET_SAMPLE_FMT rate=$TARGET_RATE ch=$TARGET_CHANNELS)" &>>"$LOGFILE"
+  fi
+  if [[ ! -f "$api_out" ]]; then
+    if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "$api_out" &>>"$LOGFILE" 2>&1; then
+      echo "prepare_api_audio: fallback conversion done -> $api_out" &>>"$LOGFILE"
     else
-      echo "normalize_audio: fallback ffmpeg conversion failed" &>>"$LOGFILE"
+      echo "prepare_api_audio: conversion failed; using original" &>>"$LOGFILE"
+      return 1
     fi
-  else
-    echo "normalize_audio: ffmpeg not available or file missing; skipping" &>>"$LOGFILE"
+  fi
+  if [[ "${VOICE_TYPE_KEEP_ORIGINAL:-1}" == "0" ]]; then
+    mv "$api_out" "$FILE.wav" && echo "prepare_api_audio: replaced original with API copy (KEEP_ORIGINAL=0)" &>>"$LOGFILE"
   fi
 }
 
-stop_recording() {
-  echo "Stopping recording..." &>>"$LOGFILE"
-  if [[ -z "${PID:-}" ]]; then
-    echo "No PID in session; nothing to stop." &>>"$LOGFILE"
-    return 0
-  fi
-  # If process doesn't exist, treat as stale
-  if [[ ! -d "/proc/$PID" ]]; then
-    echo "Process $PID not running; stale session." &>>"$LOGFILE"
-    return 0
-  fi
-  if [[ -r "/proc/$PID/cmdline" ]]; then
-    local cmdline
-    cmdline=$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null || true)
-    if [[ -n "$cmdline" && ! "$cmdline" =~ arecord ]]; then
-      echo "Note: PID $PID cmdline does not look like arecord: $cmdline" &>>"$LOGFILE"
-    fi
-  fi
-  kill "$PID" 2>/dev/null || true
-  local waited=0 max_wait=50
-  while kill -0 "$PID" 2>/dev/null; do
-    if (( waited >= max_wait )); then
-      echo "PID $PID did not exit after SIGTERM; sending SIGKILL..." &>>"$LOGFILE"
-      kill -9 "$PID" 2>/dev/null || true
-      break
-    fi
-    sleep 0.1; ((waited++))
-  done
-  if kill -0 "$PID" 2>/dev/null; then
-    echo "Attempting killall arecord as fallback..." &>>"$LOGFILE"
-    killall -q arecord || true
-    sleep 0.2
-  fi
-  if kill -0 "$PID" 2>/dev/null; then
-    echo "Warning: Failed to stop process $PID (stale)." &>>"$LOGFILE"
-  else
-    echo "Stopped recording (pid $PID)." &>>"$LOGFILE"
-  fi
-}
-
-output_transcript() {
-  if [[ -f "$FILE.txt" ]]; then
-    perl -pi -e 'chomp if eof' "$FILE.txt"
-    xclip -selection clipboard < "$FILE.txt" &>>"$LOGFILE" || true
-    echo "Transcript copied to clipboard: $FILE.txt" &>>"$LOGFILE"
-    notify "Transcription ready" "CTRL-V"
-  else
-    echo "Transcript file missing: $FILE.txt" &>>"$LOGFILE"
-    notify "Transcription failed" "Transcript file missing: $FILE.txt"
-  fi
-}
+# Backward compatibility wrapper (old name used in main)
+normalize_audio() { prepare_api_audio; }
 
 transcribe_with_openai() {
-  if [[ ! -f "$FILE.wav" ]]; then
-    echo "Audio file not found: $FILE.wav" &>>"$LOGFILE"
+  local src
+  src="${FILE}.api.wav"
+  [[ -f "$src" ]] || src="${FILE}.wav"
+  if [[ ! -f "$src" ]]; then
+    echo "Audio file not found: $src" &>>"$LOGFILE"
     return 1
   fi
   curl --fail --request POST \
     --url https://api.openai.com/v1/audio/transcriptions \
     --header "Authorization: Bearer $OPEN_AI_TOKEN" \
     --header 'Content-Type: multipart/form-data' \
-    --form file="@$FILE.wav" \
+    --form file="@$src" \
     --form model=whisper-1 \
     --form response_format=text \
     -o "${FILE}.txt" &>>"$LOGFILE"
-  echo "transcribe_with_openai: request finished (output ${FILE}.txt)" &>>"$LOGFILE"
+  echo "transcribe_with_openai: request finished (input $(basename "$src") output ${FILE}.txt)" &>>"$LOGFILE"
 }
 
 transcribe_with_deepgram() {
-  if [[ ! -f "$FILE.wav" ]]; then
-    echo "Audio file not found: $FILE.wav";
-    echo "Audio file not found: $FILE.wav" &>>"$LOGFILE"
+  local src
+  src="${FILE}.api.wav"
+  [[ -f "$src" ]] || src="${FILE}.wav"
+  if [[ ! -f "$src" ]]; then
+    echo "Audio file not found: $src" &>>"$LOGFILE"
     return 1
   fi
   DPARAMS="model=nova-3-general&smart_format=true&detect_language=true"
@@ -326,9 +317,9 @@ transcribe_with_deepgram() {
     --url "https://api.deepgram.com/v1/listen?${DPARAMS}" \
     --header "Authorization: Token $DEEPGRAM_TOKEN" \
     --header 'Content-Type: audio/wav' \
-    --data-binary "@$FILE.wav" \
+    --data-binary "@$src" \
     -o "${FILE}.json" &>>"$LOGFILE"
-  echo "transcribe_with_deepgram: request finished (output ${FILE}.json)" &>>"$LOGFILE"
+  echo "transcribe_with_deepgram: request finished (input $(basename "$src") output ${FILE}.json)" &>>"$LOGFILE"
   if [[ -f "$FILE.json" ]]; then
     jq '.results.channels[0].alternatives[0].transcript' -r "${FILE}.json" >"${FILE}.txt" || true
     echo "transcribe_with_deepgram: wrote ${FILE}.txt" &>>"$LOGFILE"
@@ -375,7 +366,7 @@ main() {
       return
     fi
     stop_recording || true
-    normalize_audio || true
+    prepare_api_audio || true
     transcript || true
     output_transcript || true
     cleanup_session
