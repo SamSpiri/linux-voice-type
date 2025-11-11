@@ -13,13 +13,29 @@ readonly AUDIO_INPUT='hw:2,0' # Use `arecord -l` to list available devices
 source "$HOME/.config/linux-voice-type"      # Ensure this file has restrictive permissions
 
 readonly PREFERRED_FORMATS=(S16_LE S24_LE S24_3LE S32_LE)
-readonly PREFERRED_RATES=(48000 44100 16000 32000)
+readonly PREFERRED_RATES=(16000 44100 48000 32000)
 readonly PREFERRED_CHANNELS=(1 2)
 
 # FILE and PID will be set dynamically; shellcheck disable=SC2034 for sourced vars
 # (They are intentionally global for subsequent function calls.)
 FILE=""
 PID=""
+
+# default logfile before FILE is known; will be switched to $FILE.log after start_recording
+readonly DEFAULT_LOGFILE="${HOME}/.local/var/voice-type/voice-type.log"
+LOGFILE="$DEFAULT_LOGFILE"
+
+# Send desktop notification if possible
+notify() {
+  # Allow disabling via VOICE_TYPE_NO_NOTIFY=1
+  if [[ "${VOICE_TYPE_NO_NOTIFY:-0}" == "1" ]]; then return 0; fi
+  if command -v notify-send &>/dev/null; then
+    local title="$1" body="${2:-}"
+    # shellcheck disable=SC2016
+    notify-send --app-name="VoiceType" --icon=audio-input-microphone "$title" "$body"
+    echo "notify: $title ${body}" &>>"$LOGFILE"
+  fi
+}
 
 # Ensure state directory exists
 ensure_state_dirs() {
@@ -29,29 +45,40 @@ ensure_state_dirs() {
 
 detect_default_device() {
   if command -v wpctl &>/dev/null; then
-    echo "default"; return
+    echo "default"
+    echo "default" &>>"$LOGFILE"
+    return
   fi
   if command -v pactl &>/dev/null; then
-    echo "default"; return
+    echo "default"
+    echo "default" &>>"$LOGFILE"
+    return
   fi
   local card dev
   if arecord -l 2>/dev/null | awk '/card [0-9]+:/ {print; exit}' | \
      sed -E 's/.*card ([0-9]+).*, device ([0-9]+).*/\1 \2/' >/dev/null; then
     read -r card dev < <(arecord -l | awk '/card [0-9]+:/ {print; exit}' | sed -E 's/.*card ([0-9]+).*, device ([0-9]+).*/\1 \2/')
-    echo "plughw:${card},${dev}"; return
+    echo "plughw:${card},${dev}"
+    echo "plughw:${card},${dev}" &>>"$LOGFILE"
+    return
   fi
   echo "default"
+  echo "default" &>>"$LOGFILE"
 }
 
 sanity_check() {
   for cmd in xdotool arecord killall jq curl timeout; do
     if ! command -v "$cmd" &>/dev/null; then
-      echo >&2 "Error: command $cmd not found."; exit 1
+      echo >&2 "Error: command $cmd not found."
+      echo "Error: command $cmd not found." &>>"$LOGFILE"
+      exit 1
     fi
   done
   set +u
   if [[ -z "${DEEPGRAM_TOKEN:-}" && -z "${OPEN_AI_TOKEN:-}" ]]; then
-    echo >&2 "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable."; exit 1
+    echo >&2 "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable."
+    echo "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable." &>>"$LOGFILE"
+    exit 1
   fi
   set -u
 }
@@ -59,9 +86,11 @@ sanity_check() {
 probe_params() {
   local dev="$1"
   local dump
-  dump="$(timeout 2 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
+  dump="$(timeout 1 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
   if [[ -z "$dump" ]]; then
-    echo "FORMAT=S16_LE RATE=44100 CHANNELS=1"; return
+    echo "FORMAT=S16_LE RATE=16000 CHANNELS=1"
+    echo "FORMAT=S16_LE RATE=16000 CHANNELS=1" &>>"$LOGFILE"
+    return
   fi
   local formats chans_line chans_list rate_line rate_lo rate_hi chosen_format chosen_rate chosen_channels
   formats=$(awk '/^FORMAT:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
@@ -92,18 +121,22 @@ probe_params() {
     if grep -qw "$c" <<<"$chans_list"; then chosen_channels="$c"; break; fi
   done
   [[ -z $chosen_channels ]] && chosen_channels=1
+  # Print to stdout for callers (e.g. params=$(probe_params ...)) and also append to the logfile
   echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels"
+  echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels" &>>"$LOGFILE"
 }
 
 start_recording() {
   ensure_state_dirs
   # Pick a new timestamped file only for a new session
   FILE="${HOME}/.local/var/voice-type/recording-$(date +%Y%m%d-%H%M%S)"
+  # switch logging to the per-session logfile
+  LOGFILE="${FILE}.log"
   local dev params FORMAT RATE CHANNELS
   dev=$(detect_default_device)
   params=$(probe_params "$dev")
   eval "$params"  # sets FORMAT RATE CHANNELS
-  echo "Recording from device '$dev' format=$FORMAT rate=$RATE channels=$CHANNELS"
+  echo "Recording from device '$dev' format=$FORMAT rate=$RATE channels=$CHANNELS" &>>"$LOGFILE"
   set -x
   nohup arecord -D "$dev" -f "$FORMAT" -r "$RATE" -c "$CHANNELS" "$FILE.wav" --duration="$MAX_DURATION" &>>"$FILE.arecord.log" &
   PID=$!
@@ -112,65 +145,72 @@ start_recording() {
   : > "$SESSION_FILE"
   echo "FILE=$FILE" >> "$SESSION_FILE"
   echo "PID=$PID" >> "$SESSION_FILE"
-  echo "Started session: FILE=$FILE PID=$PID"
+  echo "Started session: FILE=$FILE PID=$PID" &>>"$LOGFILE"
 }
 
 normalize_audio() {
   if command -v ffmpeg &>/dev/null && [[ -f "$FILE.wav" ]]; then
-    ffmpeg -y -i "$FILE.wav" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$FILE.log" && mv "${FILE}-norm.wav" "$FILE.wav"
+    ffmpeg -y -i "$FILE.wav" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>>"$LOGFILE" && mv "${FILE}-norm.wav" "$FILE.wav"
+    echo "normalize_audio: normalized $FILE.wav to 16k mono s16" &>>"$LOGFILE"
   fi
 }
 
 stop_recording() {
-  echo "Stopping recording..."
+  echo "Stopping recording..." &>>"$LOGFILE"
   if [[ -z "${PID:-}" ]]; then
-    echo "No PID in session; nothing to stop."; return 0
+    echo "No PID in session; nothing to stop." &>>"$LOGFILE"
+    return 0
   fi
   # If process doesn't exist, treat as stale
   if [[ ! -d "/proc/$PID" ]]; then
-    echo "Process $PID not running; stale session."; return 0
+    echo "Process $PID not running; stale session." &>>"$LOGFILE"
+    return 0
   fi
   if [[ -r "/proc/$PID/cmdline" ]]; then
     local cmdline
     cmdline=$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null || true)
     if [[ -n "$cmdline" && ! "$cmdline" =~ arecord ]]; then
-      echo "Note: PID $PID cmdline does not look like arecord: $cmdline"
+      echo "Note: PID $PID cmdline does not look like arecord: $cmdline" &>>"$LOGFILE"
     fi
   fi
   kill "$PID" 2>/dev/null || true
   local waited=0 max_wait=50
   while kill -0 "$PID" 2>/dev/null; do
     if (( waited >= max_wait )); then
-      echo "PID $PID did not exit after SIGTERM; sending SIGKILL..."
+      echo "PID $PID did not exit after SIGTERM; sending SIGKILL..." &>>"$LOGFILE"
       kill -9 "$PID" 2>/dev/null || true
       break
     fi
     sleep 0.1; ((waited++))
   done
   if kill -0 "$PID" 2>/dev/null; then
-    echo "Attempting killall arecord as fallback..."
+    echo "Attempting killall arecord as fallback..." &>>"$LOGFILE"
     killall -q arecord || true
     sleep 0.2
   fi
   if kill -0 "$PID" 2>/dev/null; then
-    echo "Warning: Failed to stop process $PID (stale)."
+    echo "Warning: Failed to stop process $PID (stale)." &>>"$LOGFILE"
   else
-    echo "Stopped recording (pid $PID)."
+    echo "Stopped recording (pid $PID)." &>>"$LOGFILE"
   fi
 }
 
 output_transcript() {
   if [[ -f "$FILE.txt" ]]; then
     perl -pi -e 'chomp if eof' "$FILE.txt"
-    xclip -selection clipboard < "$FILE.txt" &>>"$FILE.log" || true
+    xclip -selection clipboard < "$FILE.txt" &>>"$LOGFILE" || true
+    echo "Transcript copied to clipboard: $FILE.txt" &>>"$LOGFILE"
+    notify "Transcription ready" "CTRL-V"
   else
-    echo "Transcript file missing: $FILE.txt" >&2
+    echo "Transcript file missing: $FILE.txt" &>>"$LOGFILE"
+    notify "Transcription failed" "Transcript file missing: $FILE.txt"
   fi
 }
 
 transcribe_with_openai() {
   if [[ ! -f "$FILE.wav" ]]; then
-    echo "Audio file not found: $FILE.wav"; return 1
+    echo "Audio file not found: $FILE.wav" &>>"$LOGFILE"
+    return 1
   fi
   curl --fail --request POST \
     --url https://api.openai.com/v1/audio/transcriptions \
@@ -179,12 +219,15 @@ transcribe_with_openai() {
     --form file="@$FILE.wav" \
     --form model=whisper-1 \
     --form response_format=text \
-    -o "${FILE}.txt" &>>"$FILE.log"
+    -o "${FILE}.txt" &>>"$LOGFILE"
+  echo "transcribe_with_openai: request finished (output ${FILE}.txt)" &>>"$LOGFILE"
 }
 
 transcribe_with_deepgram() {
   if [[ ! -f "$FILE.wav" ]]; then
-    echo "Audio file not found: $FILE.wav"; return 1
+    echo "Audio file not found: $FILE.wav";
+    echo "Audio file not found: $FILE.wav" &>>"$LOGFILE"
+    return 1
   fi
   DPARAMS="model=nova-3-general&smart_format=true&detect_language=true"
   curl --fail --request POST \
@@ -192,9 +235,11 @@ transcribe_with_deepgram() {
     --header "Authorization: Token $DEEPGRAM_TOKEN" \
     --header 'Content-Type: audio/wav' \
     --data-binary "@$FILE.wav" \
-    -o "${FILE}.json" &>>"$FILE.log"
+    -o "${FILE}.json" &>>"$LOGFILE"
+  echo "transcribe_with_deepgram: request finished (output ${FILE}.json)" &>>"$LOGFILE"
   if [[ -f "$FILE.json" ]]; then
     jq '.results.channels[0].alternatives[0].transcript' -r "${FILE}.json" >"${FILE}.txt" || true
+    echo "transcribe_with_deepgram: wrote ${FILE}.txt" &>>"$LOGFILE"
   fi
 }
 
@@ -210,6 +255,7 @@ transcript() {
 
 cleanup_session() {
   rm -f "$SESSION_FILE" || true
+  echo "cleanup_session: removed $SESSION_FILE" &>>"$LOGFILE"
 }
 
 main() {
@@ -220,10 +266,12 @@ main() {
     # shellcheck disable=SC1090
     source "$SESSION_FILE" || true
     if [[ -z "${FILE:-}" ]]; then
-      echo "Session file missing FILE variable; aborting." >&2
+      echo "Session file missing FILE variable; aborting." &>>"$LOGFILE"
       cleanup_session
       exit 1
     fi
+    # ensure per-session logfile if FILE was set from session file
+    LOGFILE="${FILE}.log"
     stop_recording || true
     normalize_audio || true
     transcript || true
