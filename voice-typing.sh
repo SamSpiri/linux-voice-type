@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # usage: exec ./voice-typing.sh twice to start and stop recording
-# Dependencies: curl, jq, arecord, xdotool, killall
-# Added: flock for locking concurrent invocations
+# Dependencies: curl, jq, arecord, xdotool, killall, flock, xclip, perl
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -14,22 +13,17 @@ readonly MAX_DURATION=3600
 readonly AUDIO_INPUT='hw:2,0' # Use `arecord -l` to list available devices
 source "$HOME/.config/linux-voice-type"      # Ensure this file has restrictive permissions
 
-# Prefer higher bit-depth first: 24-bit (packed & 3-byte), then 32-bit, then 16-bit.
-readonly PREFERRED_FORMATS=(S24_LE S24_3LE S32_LE S16_LE)
-# New preference arrays for decision logic
+# Preference arrays for decision logic (recording and API conversion)
+# Order defines desirability; first match wins.
 readonly RECORD_FORMAT_PREF=(S32_LE S24_LE S24_3LE S24_32LE S16_LE)
 readonly API_FORMAT_PREF=(S24_LE S32_LE S16_LE)
 
 # FILE and PID will be set dynamically; shellcheck disable=SC2034 for sourced vars
-# (They are intentionally global for subsequent function calls.)
 FILE=""
 PID=""
 
-# default logfile before FILE is known; will be switched to $FILE.log after start_recording
 readonly DEFAULT_LOGFILE="${HOME}/.local/var/voice-type/voice-type.log"
 LOGFILE="$DEFAULT_LOGFILE"
-
-# Lock file FD (chosen high to avoid clashes); will be assigned in acquire_lock
 LOCK_FD=0
 
 # Send desktop notification if possible
@@ -104,7 +98,7 @@ detect_default_device() {
 }
 
 sanity_check() {
-  for cmd in xdotool arecord killall jq curl timeout flock; do
+  for cmd in xdotool arecord killall jq curl timeout flock xclip perl; do
     if ! command -v "$cmd" &>/dev/null; then
       echo >&2 "Error: command $cmd not found."
       echo "Error: command $cmd not found." &>>"$LOGFILE"
@@ -122,18 +116,17 @@ sanity_check() {
   set -u
 }
 
+# Probe hardware params; choose preferred format and simple rate/channels.
 probe_params() {
-  local dev="$1"
-  local dump
+  local dev="$1" dump
   dump="$(timeout 0.1 arecord -D "$dev" -d 1 --dump-hw-params /dev/null 2>&1 || true)"
   if [[ -z "$dump" ]]; then
-    echo "FORMAT=S24_LE RATE=22000 CHANNELS=1 RAW_FORMATS='S24_LE S16_LE'"
-    echo "FORMAT=S24_LE RATE=22000 CHANNELS=1 RAW_FORMATS='S24_LE S16_LE'" &>>"$LOGFILE"
+    echo "FORMAT=S16_LE RATE=44100 CHANNELS=1 RAW_FORMATS='S16_LE'"
+    echo "probe_params: fallback (no dump) FORMAT=S16_LE RATE=44100 CHANNELS=1 RAW_FORMATS='S16_LE'" &>>"$LOGFILE"
     return
   fi
-  local formats chans_line chans_list rate_line rate_lo rate_hi chosen_format chosen_rate chosen_channels
+  local formats rate_line rate_lo rate_hi chans_line chans_list chosen_format chosen_rate chosen_channels
   formats=$(awk '/^FORMAT:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump" | tr '\n' ' ')
-  # capture packed/container variants that may appear (S24_3LE, S24_32LE)
   chans_line=$(awk '/^CHANNELS:/ {print; exit}' <<<"$dump")
   if [[ $chans_line =~ \[([0-9]+)[[:space:]]+([0-9]+)\] ]]; then
     chans_list="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
@@ -144,31 +137,29 @@ probe_params() {
   if [[ $rate_line =~ \[([0-9]+)[[:space:]]+([0-9]+)\] ]]; then
     rate_lo="${BASH_REMATCH[1]}"; rate_hi="${BASH_REMATCH[2]}"
   fi
+  # Choose format
   chosen_format=""
-  for f in "${PREFERRED_FORMATS[@]}"; do
+  for f in "${RECORD_FORMAT_PREF[@]}"; do
     if grep -qw "$f" <<<"$formats"; then chosen_format="$f"; break; fi
   done
   [[ -z $chosen_format ]] && chosen_format=$(awk '{print $1; exit}' <<<"$formats" || echo S16_LE)
-  chosen_rate=""
+  # Rate: pick high end within typical speech range if available, else 44100
   if [[ -n ${rate_lo:-} && -n ${rate_hi:-} ]]; then
-    for r in "${PREFERRED_RATES[@]}"; do
-      if (( r >= rate_lo && r <= rate_hi )); then chosen_rate="$r"; break; fi
-    done
+    if (( rate_hi >= 48000 )); then chosen_rate=48000
+    elif (( rate_hi >= 44100 )); then chosen_rate=44100
+    else chosen_rate=$rate_hi
+    fi
+  else
+    chosen_rate=44100
   fi
-  [[ -z $chosen_rate ]] && chosen_rate=44100
-  chosen_channels=""
-  for c in "${PREFERRED_CHANNELS[@]}"; do
-    if grep -qw "$c" <<<"$chans_list"; then chosen_channels="$c"; break; fi
-  done
-  [[ -z $chosen_channels ]] && chosen_channels=1
+  # Channels: prefer mono (1) else first listed
+  if grep -qw 1 <<<"$chans_list"; then chosen_channels=1; else chosen_channels=$(awk '{print $1; exit}' <<<"$chans_list" || echo 1); fi
   echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels RAW_FORMATS='$formats'"
-  echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels RAW_FORMATS='$formats'" &>>"$LOGFILE"
+  echo "probe_params: FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels RAW_FORMATS='$formats'" &>>"$LOGFILE"
 }
 
 choose_formats() {
-  # Inputs: RAW_FORMATS space separated list; optional env overrides.
   local available="$RAW_FORMATS" f record api
-  # Apply override if valid
   if [[ -n "${VOICE_TYPE_FORCE_RECORD_FORMAT:-}" && $available =~ (^|[[:space:]])${VOICE_TYPE_FORCE_RECORD_FORMAT}( |$) ]]; then
     record="$VOICE_TYPE_FORCE_RECORD_FORMAT"
   else
@@ -176,29 +167,26 @@ choose_formats() {
       if grep -qw "$f" <<<"$available"; then record="$f"; break; fi
     done
   fi
-  [[ -z $record ]] && record="S16_LE" # conservative fallback
+  [[ -z $record ]] && record="S16_LE"
   if [[ -n "${VOICE_TYPE_FORCE_API_FORMAT:-}" ]]; then
     api="$VOICE_TYPE_FORCE_API_FORMAT"
   else
-    # Derive API format from record if acceptable
     case "$record" in
       S24_LE|S24_3LE|S24_32LE) api="S24_LE" ;;
       S32_LE) api="S32_LE" ;;
       S16_LE) api="S16_LE" ;;
       *) api="S16_LE" ;;
     esac
-    # If api not in acceptable list, iterate preferences
     if ! [[ " ${API_FORMAT_PREF[*]} " =~ " $api " ]]; then
       for f in "${API_FORMAT_PREF[@]}"; do
         if grep -qw "$f" <<<"$available"; then api="$f"; break; fi
       done
     fi
   fi
-  # Final fallback
   [[ -z $api ]] && api="S16_LE"
   RECORD_FORMAT="$record"
   API_FORMAT="$api"
-  FORMAT="$RECORD_FORMAT" # backward compatibility alias
+  FORMAT="$RECORD_FORMAT"
   if [[ "${VOICE_TYPE_LOG_VERBOSE:-0}" == "1" ]]; then
     echo "choose_formats: available=[$available] record=$RECORD_FORMAT api=$API_FORMAT overrides(rec=${VOICE_TYPE_FORCE_RECORD_FORMAT:-none},api=${VOICE_TYPE_FORCE_API_FORMAT:-none})" &>>"$LOGFILE"
   fi
@@ -211,14 +199,13 @@ start_recording() {
   local dev params FORMAT RATE CHANNELS RAW_FORMATS
   dev=$(detect_default_device)
   params=$(probe_params "$dev")
-  eval "$params"  # sets FORMAT RATE CHANNELS RAW_FORMATS
+  eval "$params"
   choose_formats
   echo "Recording from device '$dev' record_format=$RECORD_FORMAT api_format=$API_FORMAT rate=$RATE channels=$CHANNELS" &>>"$LOGFILE"
   set -x
   nohup arecord -D "$dev" -f "$RECORD_FORMAT" -r "$RATE" -c "$CHANNELS" "$FILE.wav" --duration="$MAX_DURATION" &>>"$FILE.arecord.log" &
   PID=$!
   set +x
-  # Initialize / append to session file
   : > "$SESSION_FILE"
   echo "FILE=$FILE" >> "$SESSION_FILE"
   echo "PID=$PID" >> "$SESSION_FILE"
@@ -231,15 +218,8 @@ start_recording() {
 }
 
 prepare_api_audio() {
-  # Create or refresh API copy (FILE.api.wav) preserving API_FORMAT and applying loudnorm.
-  if ! command -v ffmpeg &>/dev/null; then
-    echo "prepare_api_audio: ffmpeg not installed; using original recording" &>>"$LOGFILE"
-    return 0
-  fi
-  if [[ ! -f "$FILE.wav" ]]; then
-    echo "prepare_api_audio: source file missing ($FILE.wav)" &>>"$LOGFILE"
-    return 1
-  fi
+  if ! command -v ffmpeg &>/dev/null; then echo "prepare_api_audio: ffmpeg not installed; using original recording" &>>"$LOGFILE"; return 0; fi
+  if [[ ! -f "$FILE.wav" ]]; then echo "prepare_api_audio: source file missing ($FILE.wav)" &>>"$LOGFILE"; return 1; fi
   local TARGET_FORMAT TARGET_SAMPLE_FMT TARGET_RATE TARGET_CHANNELS api_out
   TARGET_FORMAT="${API_FORMAT:-${RECORD_FORMAT:-S16_LE}}"
   TARGET_RATE="${RATE:-44100}"
@@ -273,8 +253,7 @@ prepare_api_audio() {
     if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -sample_fmt "$TARGET_SAMPLE_FMT" "$api_out" &>>"$LOGFILE" 2>&1; then
       echo "prepare_api_audio: fallback conversion done -> $api_out" &>>"$LOGFILE"
     else
-      echo "prepare_api_audio: conversion failed; using original" &>>"$LOGFILE"
-      return 1
+      echo "prepare_api_audio: conversion failed; using original" &>>"$LOGFILE"; return 1
     fi
   fi
   if [[ "${VOICE_TYPE_KEEP_ORIGINAL:-1}" == "0" ]]; then
@@ -282,17 +261,57 @@ prepare_api_audio() {
   fi
 }
 
-# Backward compatibility wrapper (old name used in main)
-normalize_audio() { prepare_api_audio; }
+# Restore original stop_recording function (critical)
+stop_recording() {
+  echo "Stopping recording..." &>>"$LOGFILE"
+  if [[ -z "${PID:-}" ]]; then echo "No PID in session; nothing to stop." &>>"$LOGFILE"; return 0; fi
+  if [[ ! -d "/proc/$PID" ]]; then echo "Process $PID not running; stale session." &>>"$LOGFILE"; return 0; fi
+  if [[ -r "/proc/$PID/cmdline" ]]; then
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "/proc/$PID/cmdline" 2>/dev/null || true)
+    if [[ -n "$cmdline" && ! "$cmdline" =~ arecord ]]; then
+      echo "Note: PID $PID cmdline does not look like arecord: $cmdline" &>>"$LOGFILE"
+    fi
+  fi
+  kill "$PID" 2>/dev/null || true
+  local waited=0 max_wait=50
+  while kill -0 "$PID" 2>/dev/null; do
+    if (( waited >= max_wait )); then
+      echo "PID $PID did not exit after SIGTERM; sending SIGKILL..." &>>"$LOGFILE"
+      kill -9 "$PID" 2>/dev/null || true
+      break
+    fi
+    sleep 0.1; ((waited++))
+  done
+  if kill -0 "$PID" 2>/dev/null; then
+    echo "Attempting killall arecord as fallback..." &>>"$LOGFILE"
+    killall -q arecord || true
+    sleep 0.2
+  fi
+  if kill -0 "$PID" 2>/dev/null; then
+    echo "Warning: Failed to stop process $PID (stale)." &>>"$LOGFILE"
+  else
+    echo "Stopped recording (pid $PID)." &>>"$LOGFILE"
+  fi
+}
+
+output_transcript() {
+  if [[ -f "$FILE.txt" ]]; then
+    perl -pi -e 'chomp if eof' "$FILE.txt" 2>/dev/null || true
+    xclip -selection clipboard < "$FILE.txt" &>>"$LOGFILE" || true
+    echo "Transcript copied to clipboard: $FILE.txt" &>>"$LOGFILE"
+    notify "Transcription ready" "CTRL-V"
+  else
+    echo "Transcript file missing: $FILE.txt" &>>"$LOGFILE"
+    notify "Transcription failed" "Transcript file missing: $FILE.txt"
+  fi
+}
 
 transcribe_with_openai() {
   local src
   src="${FILE}.api.wav"
   [[ -f "$src" ]] || src="${FILE}.wav"
-  if [[ ! -f "$src" ]]; then
-    echo "Audio file not found: $src" &>>"$LOGFILE"
-    return 1
-  fi
+  if [[ ! -f "$src" ]]; then echo "Audio file not found: $src" &>>"$LOGFILE"; return 1; fi
   curl --fail --request POST \
     --url https://api.openai.com/v1/audio/transcriptions \
     --header "Authorization: Bearer $OPEN_AI_TOKEN" \
@@ -308,10 +327,7 @@ transcribe_with_deepgram() {
   local src
   src="${FILE}.api.wav"
   [[ -f "$src" ]] || src="${FILE}.wav"
-  if [[ ! -f "$src" ]]; then
-    echo "Audio file not found: $src" &>>"$LOGFILE"
-    return 1
-  fi
+  if [[ ! -f "$src" ]]; then echo "Audio file not found: $src" &>>"$LOGFILE"; return 1; fi
   DPARAMS="model=nova-3-general&smart_format=true&detect_language=true"
   curl --fail --request POST \
     --url "https://api.deepgram.com/v1/listen?${DPARAMS}" \
@@ -328,11 +344,7 @@ transcribe_with_deepgram() {
 
 transcript() {
   set +u
-  if [[ -z "${DEEPGRAM_TOKEN:-}" ]]; then
-    transcribe_with_openai || true
-  else
-    transcribe_with_deepgram || true
-  fi
+  if [[ -z "${DEEPGRAM_TOKEN:-}" ]]; then transcribe_with_openai || true; else transcribe_with_deepgram || true; fi
   set -u
 }
 
@@ -344,9 +356,7 @@ cleanup_session() {
 main() {
   ensure_state_dirs
   sanity_check
-  if ! acquire_lock; then
-    exit 1
-  fi
+  if ! acquire_lock; then exit 1; fi
   trap release_lock EXIT
   if [[ -f "$SESSION_FILE" ]]; then
     # Stop phase
@@ -362,7 +372,7 @@ main() {
       echo "Fallback: no arecord process and no audio file; starting new recording instead." &>>"$LOGFILE"
       cleanup_session
       start_recording
-      notify "Recording started" "Tigger again to stop"
+      notify "Recording started" "Trigger again to stop"
       return
     fi
     stop_recording || true
