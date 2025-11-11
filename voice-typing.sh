@@ -12,15 +12,102 @@ readonly MAX_DURATION=3600
 readonly AUDIO_INPUT='hw:2,0' # Use `arecord -l` to list available devices
 source "$HOME/.config/linux-voice-type"      # Ensure this file has restrictive permissions
 
+readonly PREFERRED_FORMATS=(S16_LE S24_LE S24_3LE S32_LE)
+readonly PREFERRED_RATES=(48000 44100 16000 32000)
+readonly PREFERRED_CHANNELS=(1 2)
+
+detect_default_device() {
+  if command -v wpctl &>/dev/null; then
+    # PipeWire: just use 'default' (PipeWire will route to current selected source)
+    echo "default"
+    return
+  fi
+  if command -v pactl &>/dev/null; then
+    # PulseAudio/PipeWire compatibility
+    echo "default"
+    return
+  fi
+  # Fallback to first ALSA card
+  local card dev
+  if arecord -l 2>/dev/null | awk '/card [0-9]+:/ {print; exit}' | \
+     sed -E 's/.*card ([0-9]+).*, device ([0-9]+).*/\1 \2/' >/dev/null; then
+    read -r card dev < <(arecord -l | awk '/card [0-9]+:/ {print; exit}' | sed -E 's/.*card ([0-9]+).*, device ([0-9]+).*/\1 \2/')
+    echo "plughw:${card},${dev}"
+    return
+  fi
+  echo "default"
+}
+
+probe_params() {
+  local dev="$1"
+  local dump
+  if ! dump="$(arecord -D "$dev" --dump-hw-params /dev/null 2>&1)"; then
+    echo "FORMAT=S16_LE RATE=44100 CHANNELS=1"
+    return
+  fi
+  local formats rates chans
+  formats=$(awk '/FORMAT:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
+  rates=$(awk '/RATE:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
+  chans=$(awk '/CHANNELS:/ {for(i=2;i<=NF;i++) print $i}' <<<"$dump")
+
+  local chosen_format=""
+  for f in "${PREFERRED_FORMATS[@]}"; do
+    if grep -q "$f" <<<"$formats"; then chosen_format="$f"; break; fi
+  done
+  [[ -z $chosen_format ]] && chosen_format=$(head -n1 <<<"$formats")
+
+  # Rate lines may be ranges like 8000-48000; pick first preferred inside any range or exact match.
+  local chosen_rate=""
+  for r in "${PREFERRED_RATES[@]}"; do
+    if grep -qw "$r" <<<"$rates"; then chosen_rate="$r"; break
+    elif grep -Eq "([0-9]+)-([0-9]+)" <<<"$rates"; then
+      local lo hi
+      lo=$(grep -Eo '([0-9]+)-([0-9]+)' <<<"$rates" | head -n1 | cut -d- -f1)
+      hi=$(grep -Eo '([0-9]+)-([0-9]+)' <<<"$rates" | head -n1 | cut -d- -f2)
+      if (( r >= lo && r <= hi )); then chosen_rate="$r"; break; fi
+    fi
+  done
+  [[ -z $chosen_rate ]] && chosen_rate=$(grep -Eo '^[0-9]+' <<<"$rates" | head -n1 || echo 44100)
+
+  local chosen_channels=""
+  for c in "${PREFERRED_CHANNELS[@]}"; do
+    if grep -qw "$c" <<<"$chans"; then chosen_channels="$c"; break; fi
+  done
+  [[ -z $chosen_channels ]] && chosen_channels=$(head -n1 <<<"$chans" || echo 1)
+
+  echo "FORMAT=$chosen_format RATE=$chosen_rate CHANNELS=$chosen_channels"
+}
+
 start_recording() {
   mkdir -p "$(dirname "$FILE")"
   mkdir -p "$(dirname "$PID_FILE")"
-  echo "Starting new recording..."
+  local dev params FORMAT RATE CHANNELS
+  dev=$(detect_default_device)
+  params=$(probe_params "$dev")
+  eval "$params"   # sets FORMAT RATE CHANNELS
+  echo "Recording from device '$dev' format=$FORMAT rate=$RATE channels=$CHANNELS"
   set -x
-  nohup arecord --device="$AUDIO_INPUT" --format cd "$FILE.wav" --duration="$MAX_DURATION" &>/dev/null &
+  nohup arecord -D "$dev" -f "$FORMAT" -r "$RATE" -c "$CHANNELS" "$FILE.wav" --duration="$MAX_DURATION" &>/dev/null &
   set +x
   echo $! >"$PID_FILE"
 }
+
+# Optional post-processing (call before transcription) to normalize for Whisper:
+normalize_audio() {
+  if command -v ffmpeg &>/dev/null; then
+    ffmpeg -y -i "$FILE.wav" -ac 1 -ar 16000 -sample_fmt s16 "${FILE}-norm.wav" &>/dev/null && mv "${FILE}-norm.wav" "$FILE.wav"
+  fi
+}
+
+#start_recording() {
+#  mkdir -p "$(dirname "$FILE")"
+#  mkdir -p "$(dirname "$PID_FILE")"
+#  echo "Starting new recording..."
+#  set -x
+#  nohup arecord --device="$AUDIO_INPUT" --format cd "$FILE.wav" --duration="$MAX_DURATION" &>/dev/null &
+#  set +x
+#  echo $! >"$PID_FILE"
+#}
 
 stop_recording() {
   echo "Stopping recording..."
