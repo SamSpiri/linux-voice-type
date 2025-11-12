@@ -215,31 +215,31 @@ codec_for_format() {
 
 # Compress long silence segments
 # Uses ffmpeg silenceremove filter leaving up to leave_silence seconds.
-compress_silence() {
-  local infile="$1" outfile="$2" max silent_thresh min apply
-  apply="${VOICE_TYPE_SILENCE_ENABLE:-1}"
-  [[ "$apply" == "1" ]] || { echo "compress_silence: disabled" &>>"$LOGFILE"; return 0; }
-  [[ -f "$infile" ]] || { echo "compress_silence: infile missing ($infile)" &>>"$LOGFILE"; return 1; }
-  max="${VOICE_TYPE_SILENCE_MID:-1.0}"          # seconds of silence to retain
-  silent_thresh="${VOICE_TYPE_SILENCE_THRESHOLD:--60dB}" # threshold defining silence
-  min="${VOICE_TYPE_SILENCE_EDGE:-0.3}"          # minimum continuous silence duration to trigger compression
-
-  local filter_spec
-  filter_spec="silenceremove=start_periods=1:start_silence=${min}:start_threshold=${silent_thresh}:stop_periods=-1:stop_silence=${min}:stop_threshold=${silent_thresh}"
-
-  # Try with -af first, capture stderr to inspect failures.
-  local attempt_log success=0
-  attempt_log="$(ffmpeg -hide_banner -nostats -y -i "$infile" -af "$filter_spec" "$outfile" 2>&1)" || true
-  if [[ -f "$outfile" ]]; then
-    success=1
-  else
-    if (( success == 0 )); then
-      echo "compress_silence: filter application failed; keeping original (${attempt_log%%$'\n'*})" &>>"$LOGFILE"
-      return 1
-    fi
-  fi
-  return 0
-}
+#compress_silence() {
+#  local infile="$1" outfile="$2" max silent_thresh min apply
+#  apply="${VOICE_TYPE_SILENCE_ENABLE:-1}"
+#  [[ "$apply" == "1" ]] || { echo "compress_silence: disabled" &>>"$LOGFILE"; return 0; }
+#  [[ -f "$infile" ]] || { echo "compress_silence: infile missing ($infile)" &>>"$LOGFILE"; return 1; }
+#  max="${VOICE_TYPE_SILENCE_MID:-1.0}"          # seconds of silence to retain
+#  silent_thresh="${VOICE_TYPE_SILENCE_THRESHOLD:--60dB}" # threshold defining silence
+#  min="${VOICE_TYPE_SILENCE_EDGE:-0.3}"          # minimum continuous silence duration to trigger compression
+#
+#  local filter_spec
+#  filter_spec="silenceremove=start_periods=1:start_silence=${min}:start_threshold=${silent_thresh}:stop_periods=-1:stop_silence=${min}:stop_threshold=${silent_thresh}"
+#
+#  # Try with -af first, capture stderr to inspect failures.
+#  local attempt_log success=0
+#  attempt_log="$(ffmpeg -hide_banner -nostats -y -i "$infile" -af "$filter_spec" "$outfile" 2>&1)" || true
+#  if [[ -f "$outfile" ]]; then
+#    success=1
+#  else
+#    if (( success == 0 )); then
+#      echo "compress_silence: filter application failed; keeping original (${attempt_log%%$'\n'*})" &>>"$LOGFILE"
+#      return 1
+#    fi
+#  fi
+#  return 0
+#}
 
 start_recording() {
   ensure_state_dirs
@@ -269,7 +269,7 @@ start_recording() {
 prepare_api_audio() {
   if ! command -v ffmpeg &>/dev/null; then echo "prepare_api_audio: ffmpeg not installed; using original recording" &>>"$LOGFILE"; return 0; fi
   if [[ ! -f "$FILE.wav" ]]; then echo "prepare_api_audio: source file missing ($FILE.wav)" &>>"$LOGFILE"; return 1; fi
-  compress_silence "$FILE.wav" "${FILE}.nosilence.wav" && mv "${FILE}.wav" "${FILE}.orig.wav" && mv "${FILE}.nosilence.wav" "$FILE.wav" 2>/dev/null || true
+  # compress_silence "$FILE.wav" "${FILE}.nosilence.wav" && mv "${FILE}.wav" "${FILE}.orig.wav" && mv "${FILE}.nosilence.wav" "$FILE.wav" 2>/dev/null || true
   local TARGET_FORMAT TARGET_RATE TARGET_CHANNELS api_out TARGET_CODEC loudnorm_pass1 loudnorm_json measured_I measured_LRA measured_TP measured_thresh offset use_loudnorm
   TARGET_FORMAT="${API_FORMAT:-${RECORD_FORMAT:-S16_LE}}"
   TARGET_RATE="${VOICE_TYPE_TARGET_RATE:-${RATE:-44100}}"
@@ -281,9 +281,20 @@ prepare_api_audio() {
   use_loudnorm="${VOICE_TYPE_LOUDNORM:-1}"  # allow disabling
   echo "prepare_api_audio: target_fmt=$TARGET_FORMAT codec=$TARGET_CODEC rate=$TARGET_RATE ch=$TARGET_CHANNELS loudnorm=$use_loudnorm" &>>"$LOGFILE"
 
+  local filter_silence
+
+  if [[ "${VOICE_TYPE_SILENCE_ENABLE:-1}" == "1" ]]; then
+    max="${VOICE_TYPE_SILENCE_MID:-1.0}"          # seconds of silence to retain
+    silent_thresh="${VOICE_TYPE_SILENCE_THRESHOLD:--60dB}" # threshold defining silence
+    min="${VOICE_TYPE_SILENCE_EDGE:-0.3}"          # minimum continuous silence duration to trigger compression
+    filter_silence="silenceremove=start_periods=1:start_silence=${min}:start_threshold=${silent_thresh}:stop_periods=-1:stop_silence=${min}:stop_threshold=${silent_thresh},"
+  else
+    echo "compress_silence: disabled" &>>"$LOGFILE"
+  fi
+
   if [[ "$use_loudnorm" == "1" ]]; then # 1 pass loudnorm
     if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" \
-      -af "loudnorm=I=-23:LRA=7:TP=-2:linear=false:print_format=summary" \
+      -af "${filter_silence}loudnorm=I=-23:LRA=7:TP=-2:linear=false:print_format=summary" \
       -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a "$TARGET_CODEC" "$api_out" &>>"$LOGFILE" 2>&1; then
       echo "prepare_api_audio: loudnorm dynamic complete -> $api_out" &>>"$LOGFILE"
     else
@@ -291,50 +302,25 @@ prepare_api_audio() {
     fi
   fi
 
-  if [[ "$use_loudnorm" == "2" ]]; then # 2 pass loudnorm (bit longer)
-    loudnorm_pass1=$(ffmpeg -hide_banner -nostats -y -i "$FILE.wav" -af loudnorm=I=-23:LRA=7:TP=-2:print_format=json -f null - 2>&1 || true)
-    loudnorm_json=$(awk 'BEGIN{capture=0} /^\{/ {capture=1} capture {print} /^\}/ {if(capture){capture=0}}' <<<"$loudnorm_pass1")
-    if [[ -n "$loudnorm_json" ]]; then
-      measured_I=$(jq -r '.input_i' <<<"$loudnorm_json" 2>/dev/null || true)
-      measured_LRA=$(jq -r '.input_lra' <<<"$loudnorm_json" 2>/dev/null || true)
-      measured_TP=$(jq -r '.input_tp' <<<"$loudnorm_json" 2>/dev/null || true)
-      measured_thresh=$(jq -r '.input_thresh' <<<"$loudnorm_json" 2>/dev/null || true)
-      offset=$(jq -r '.target_offset' <<<"$loudnorm_json" 2>/dev/null || true)
-      if [[ -n "$measured_I" && "$measured_I" != "null" ]]; then
-        if ffmpeg -hide_banner -nostats -y -i "$FILE.wav" \
-          -af "loudnorm=I=-23:LRA=7:TP=-2:measured_I=$measured_I:measured_LRA=$measured_LRA:measured_TP=$measured_TP:measured_thresh=$measured_thresh:offset=$offset:linear=true:print_format=summary" \
-          -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a "$TARGET_CODEC" "$api_out" &>>"$LOGFILE" 2>&1; then
-          echo "prepare_api_audio: two-pass loudnorm complete -> $api_out (I=$measured_I LRA=$measured_LRA TP=$measured_TP)" &>>"$LOGFILE"
-        else
-          echo "prepare_api_audio: loudnorm second pass failed; will try plain conversion" &>>"$LOGFILE"
-        fi
-      else
-        echo "prepare_api_audio: loudnorm metrics missing; skipping second pass" &>>"$LOGFILE"
-      fi
-    else
-      echo "prepare_api_audio: loudnorm analysis produced no JSON; skipping normalization" &>>"$LOGFILE"
-    fi
-  fi
-
-  if [[ ! -f "$api_out" ]]; then
-    if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a "$TARGET_CODEC" "$api_out" &>>"$LOGFILE" 2>&1; then
-      echo "prepare_api_audio: plain conversion done -> $api_out" &>>"$LOGFILE"
-    else
-      # Fallback: force S16_LE
-      echo "prepare_api_audio: conversion to $TARGET_CODEC failed; falling back to pcm_s16le" &>>"$LOGFILE"
-      if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a pcm_s16le "$api_out" &>>"$LOGFILE" 2>&1; then
-        echo "prepare_api_audio: fallback to pcm_s16le succeeded" &>>"$LOGFILE"
-        API_FORMAT="S16_LE"; TARGET_FORMAT="S16_LE"; TARGET_CODEC="pcm_s16le"
-      else
-        echo "prepare_api_audio: fallback conversion failed; using original" &>>"$LOGFILE"; return 1
-      fi
-    fi
-  fi
+#  if [[ ! -f "$api_out" ]]; then
+#    if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a "$TARGET_CODEC" "$api_out" &>>"$LOGFILE" 2>&1; then
+#      echo "prepare_api_audio: plain conversion done -> $api_out" &>>"$LOGFILE"
+#    else
+#      # Fallback: force S16_LE
+#      echo "prepare_api_audio: conversion to $TARGET_CODEC failed; falling back to pcm_s16le" &>>"$LOGFILE"
+#      if ffmpeg -y -i "$FILE.wav" -ac "$TARGET_CHANNELS" -ar "$TARGET_RATE" -c:a pcm_s16le "$api_out" &>>"$LOGFILE" 2>&1; then
+#        echo "prepare_api_audio: fallback to pcm_s16le succeeded" &>>"$LOGFILE"
+#        API_FORMAT="S16_LE"; TARGET_FORMAT="S16_LE"; TARGET_CODEC="pcm_s16le"
+#      else
+#        echo "prepare_api_audio: fallback conversion failed; using original" &>>"$LOGFILE"; return 1
+#      fi
+#    fi
+#  fi
 
   # Optional loudness verification (ebur128) if requested
-  if [[ -f "$api_out" && "${VOICE_TYPE_VERIFY_LOUDNESS:-0}" == "1" ]]; then
-    ffmpeg -hide_banner -nostats -i "$api_out" -filter_complex ebur128 -f null - 2>&1 | awk '/I:/ {print "prepare_api_audio: post-normalization " $0}' &>>"$LOGFILE" || true
-  fi
+#  if [[ -f "$api_out" && "${VOICE_TYPE_VERIFY_LOUDNESS:-0}" == "1" ]]; then
+#    ffmpeg -hide_banner -nostats -i "$api_out" -filter_complex ebur128 -f null - 2>&1 | awk '/I:/ {print "prepare_api_audio: post-normalization " $0}' &>>"$LOGFILE" || true
+#  fi
 
   if [[ "${VOICE_TYPE_KEEP_ORIGINAL:-1}" == "0" && -f "$api_out" ]]; then
     mv "$api_out" "$FILE.wav" && echo "prepare_api_audio: replaced original with API copy (KEEP_ORIGINAL=0 final_codec=$TARGET_CODEC)" &>>"$LOGFILE"
@@ -353,12 +339,12 @@ stop_recording() {
       echo "Note: PID $PID cmdline does not look like arecord: $cmdline" &>>"$LOGFILE"
     fi
   fi
-  kill "$PID" 2>/dev/null || true
+  kill -INT "$PID" 2>/dev/null || true
   local waited=0 max_wait=50
   while kill -0 "$PID" 2>/dev/null; do
     if (( waited >= max_wait )); then
-      echo "PID $PID did not exit after SIGTERM; sending SIGKILL..." &>>"$LOGFILE"
-      kill -9 "$PID" 2>/dev/null || true
+      echo "PID $PID did not exit after SIGINT; sending SIGTERM..." &>>"$LOGFILE"
+      kill "$PID" 2>/dev/null || true
       break
     fi
     sleep 0.1; ((waited++))
