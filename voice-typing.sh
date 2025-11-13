@@ -17,17 +17,19 @@ readonly LOCK_FILE="${VOICE_TYPE_STATE_DIR}/lock"
 readonly DEFAULT_LOGFILE="${VOICE_TYPE_VAR_DIR}/voice-type.log"
 
 # Recording parameters (fixed simplified format)
-: "${VOICE_TYPE_DEVICE:=default}"          # ALSA device (arecord -D)
+: "${VOICE_TYPE_DEVICE:=default}"           # ALSA device (arecord -D)
 : "${VOICE_TYPE_FORMAT:=S16_LE}"            # arecord sample format
+: "${VOICE_TYPE_FORMAT_REC:=S32_LE}"        # arecord sample format
 : "${VOICE_TYPE_RATE:=22000}"               # sample rate Hz
+: "${VOICE_TYPE_RATE_REC:=44100}"           # capturing sample rate Hz
 : "${VOICE_TYPE_CHANNELS:=1}"               # channels (mono)
 : "${VOICE_TYPE_MAX_DURATION:=3600}"        # safety cap seconds
 
 # Silence removal defaults (from experimental command)
 : "${VOICE_TYPE_SILENCE_ENABLE:=1}"          # set 0 to disable silenceremove
 : "${VOICE_TYPE_SILENCE_THRESHOLD_DB:=54}"   # numeric dB value (will be used as -${value}dB)
-: "${VOICE_TYPE_SILENCE_START:=1}"         # start_silence seconds
-: "${VOICE_TYPE_SILENCE_STOP:=1}"          # stop_silence seconds
+: "${VOICE_TYPE_SILENCE_START:=1}"           # start_silence seconds
+: "${VOICE_TYPE_SILENCE_STOP:=1}"            # stop_silence seconds
 : "${VOICE_TYPE_SILENCE_START_PERIODS:=1}"   # start_periods
 : "${VOICE_TYPE_SILENCE_STOP_PERIODS:=-1}"   # stop_periods
 
@@ -137,7 +139,7 @@ start_recording_stream() {
   echo "start_recording_stream: device=$VOICE_TYPE_DEVICE format=$VOICE_TYPE_FORMAT rate=$VOICE_TYPE_RATE ch=$VOICE_TYPE_CHANNELS filter=${filter_chain}" &>>"$LOGFILE"
 
   # Start arecord producer (raw format to FIFO)
-  arecord -D "$VOICE_TYPE_DEVICE" -f "$VOICE_TYPE_FORMAT" -r "$VOICE_TYPE_RATE" -c "$VOICE_TYPE_CHANNELS" -t raw --duration "$VOICE_TYPE_MAX_DURATION" "$FIFO" &>>"$LOGFILE" 2>&1 &
+  arecord -D "$VOICE_TYPE_DEVICE" -f "$VOICE_TYPE_FORMAT_REC" -r "$VOICE_TYPE_RATE_REC" -c "$VOICE_TYPE_CHANNELS" -t raw --duration "$VOICE_TYPE_MAX_DURATION" "$FIFO" &>>"$LOGFILE" 2>&1 &
   ARECORD_PID=$!
   # Start ffmpeg consumer reading FIFO into wav applying filters
   ffmpeg -hide_banner -nostats -y -f s16le -ar "$VOICE_TYPE_RATE" -ac "$VOICE_TYPE_CHANNELS" -i "$FIFO" "${filter_chain[@]}" -ac "$VOICE_TYPE_CHANNELS" -ar "$VOICE_TYPE_RATE" -c:a pcm_s16le "${FILE}.wav" &>>"$LOGFILE" 2>&1 &
