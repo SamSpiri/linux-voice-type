@@ -18,10 +18,10 @@ readonly DEFAULT_LOGFILE="${VOICE_TYPE_VAR_DIR}/voice-type.log"
 
 # Recording parameters (fixed simplified format)
 : "${VOICE_TYPE_DEVICE:=default}"           # ALSA device (arecord -D)
-: "${VOICE_TYPE_FORMAT:=S16_LE}"            # arecord sample format
 : "${VOICE_TYPE_FORMAT_REC:=S32_LE}"        # arecord sample format
-: "${VOICE_TYPE_RATE:=22000}"               # sample rate Hz
-: "${VOICE_TYPE_RATE_REC:=44100}"           # capturing sample rate Hz
+: "${VOICE_TYPE_RATE_REC:=44100}"           # arecord sample rate Hz
+: "${VOICE_TYPE_FORMAT:=S16_LE}"            # ffmpeg sample format
+: "${VOICE_TYPE_RATE:=22000}"               # ffmpeg sample rate Hz
 : "${VOICE_TYPE_CHANNELS:=1}"               # channels (mono)
 : "${VOICE_TYPE_MAX_DURATION:=3600}"        # safety cap seconds
 
