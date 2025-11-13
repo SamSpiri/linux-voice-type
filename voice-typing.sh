@@ -261,7 +261,7 @@ transcribe_with_deepgram() {
   local DPARAMS="model=nova-3-general&smart_format=true&detect_language=ru&detect_language=en&detect_language=de"
   local ctype
   if [[ "$AUDIO_EXT" == "mp3" ]]; then ctype="audio/mpeg"; else ctype="audio/wav"; fi
-  echo curl --fail --request POST \
+  curl --fail --request POST \
     --url "https://api.deepgram.com/v1/listen?${DPARAMS}" \
     --header "Authorization: Token $DEEPGRAM_TOKEN" \
     --header "Content-Type: $ctype" \
