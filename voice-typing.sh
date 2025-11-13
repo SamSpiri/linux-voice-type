@@ -21,7 +21,7 @@ readonly DEFAULT_LOGFILE="${VOICE_TYPE_VAR_DIR}/voice-type.log"
 : "${VOICE_TYPE_FORMAT_REC:=S32_LE}"        # arecord sample format
 : "${VOICE_TYPE_RATE_REC:=44100}"           # arecord sample rate Hz
 : "${VOICE_TYPE_FORMAT:=S16_LE}"            # ffmpeg sample format
-: "${VOICE_TYPE_RATE:=22000}"               # ffmpeg sample rate Hz
+: "${VOICE_TYPE_RATE:=22000}"               # ffmpeg sample rate Hz (used for output / resample)
 : "${VOICE_TYPE_CHANNELS:=1}"               # channels (mono)
 : "${VOICE_TYPE_MAX_DURATION:=3600}"        # safety cap seconds
 
@@ -43,6 +43,10 @@ readonly DEFAULT_LOGFILE="${VOICE_TYPE_VAR_DIR}/voice-type.log"
 # Notifications
 : "${VOICE_TYPE_NO_NOTIFY:=0}"               # 1 disables notifications
 
+# Output encoding (added)
+: "${VOICE_TYPE_AUDIO_CODEC:=mp3}"          # target audio codec (mp3 for libmp3lame; wav for pcm_s16le)
+: "${VOICE_TYPE_MP3_BITRATE:=96k}"          # mp3 bitrate if mp3 selected
+
 # API tokens (must have at least one)
 # Source user config AFTER defaults to allow overrides
 if [[ -f "${HOME}/.config/linux-voice-type" ]]; then
@@ -58,6 +62,8 @@ FFMPEG_PID=""         # PID of ffmpeg consumer
 FIFO=""               # FIFO path
 LOGFILE="$DEFAULT_LOGFILE"
 LOCK_FD=0
+AUDIO_EXT=""          # derived extension based on codec
+AUDIO_FILE=""         # full path to audio file
 
 #################################
 # Utility / infrastructure funcs #
@@ -121,7 +127,12 @@ start_recording_stream() {
   FILE="${VOICE_TYPE_VAR_DIR}/recording-$(date +%Y%m%d-%H%M%S)"
   LOGFILE="${FILE}.log"
   FIFO="${FILE}.pipe"
+  # derive extension + audio file
+  if [[ "$VOICE_TYPE_AUDIO_CODEC" == "mp3" ]]; then AUDIO_EXT="mp3"; else AUDIO_EXT="wav"; fi
+  AUDIO_FILE="${FILE}.${AUDIO_EXT}"
   mkfifo "$FIFO"
+
+  ps xa | grep arecord | grep "$VOICE_TYPE_STATE_DIR" | awk '{system("kill "$1)}' || true
 
   local filter_chain
   local filters="" silent_thresh="-${VOICE_TYPE_SILENCE_THRESHOLD_DB}dB"
@@ -136,28 +147,41 @@ start_recording_stream() {
     filter_chain=(-af "$filters")
   fi
 
-  echo "start_recording_stream: device=$VOICE_TYPE_DEVICE format=$VOICE_TYPE_FORMAT rate=$VOICE_TYPE_RATE ch=$VOICE_TYPE_CHANNELS filter=${filter_chain}" &>>"$LOGFILE"
+  echo "start_recording_stream: device=$VOICE_TYPE_DEVICE format=$VOICE_TYPE_FORMAT_REC rate=$VOICE_TYPE_RATE_REC ch=$VOICE_TYPE_CHANNELS filter=${filter_chain} codec=$VOICE_TYPE_AUDIO_CODEC" &>>"$LOGFILE"
 
   # Start arecord producer (raw format to FIFO)
   arecord -D "$VOICE_TYPE_DEVICE" -f "$VOICE_TYPE_FORMAT_REC" -r "$VOICE_TYPE_RATE_REC" -c "$VOICE_TYPE_CHANNELS" -t raw --duration "$VOICE_TYPE_MAX_DURATION" "$FIFO" &>>"$LOGFILE" 2>&1 &
   ARECORD_PID=$!
-  # Start ffmpeg consumer reading FIFO into wav applying filters
-  ffmpeg -hide_banner -nostats -y -f s16le -ar "$VOICE_TYPE_RATE" -ac "$VOICE_TYPE_CHANNELS" -i "$FIFO" "${filter_chain[@]}" -ac "$VOICE_TYPE_CHANNELS" -ar "$VOICE_TYPE_RATE" -c:a pcm_s16le "${FILE}.wav" &>>"$LOGFILE" 2>&1 &
+  # Start ffmpeg consumer reading FIFO applying filters -> encoded output
+  if [[ "$VOICE_TYPE_AUDIO_CODEC" == "mp3" ]]; then
+    ffmpeg -hide_banner -nostats -y \
+      -f "$VOICE_TYPE_FORMAT" \
+      -ar "$VOICE_TYPE_RATE" -ac "$VOICE_TYPE_CHANNELS" \
+      -i "$FIFO" \
+      "${filter_chain[@]}" \
+      -ac "$VOICE_TYPE_CHANNELS" -ar "$VOICE_TYPE_RATE" \
+      -c:a libmp3lame -b:a "$VOICE_TYPE_MP3_BITRATE" "$AUDIO_FILE" &>>"$LOGFILE" 2>&1 &
+  else
+    ffmpeg -hide_banner -nostats -y \
+      -f "$VOICE_TYPE_FORMAT" \
+      -ar "$VOICE_TYPE_RATE" -ac "$VOICE_TYPE_CHANNELS" \
+      -i "$FIFO" \
+      "${filter_chain[@]}" \
+      -ac "$VOICE_TYPE_CHANNELS" -ar "$VOICE_TYPE_RATE" \
+      -c:a pcm_s16le "$AUDIO_FILE" &>>"$LOGFILE" 2>&1 &
+  fi
   FFMPEG_PID=$!
 
   # Persist session state
   : >"$SESSION_FILE"
   {
-    echo "FILE=$FILE";
-    echo "ARECORD_PID=$ARECORD_PID";
-    echo "FFMPEG_PID=$FFMPEG_PID";
-    echo "FIFO=$FIFO";
+    echo "FILE=$FILE"; echo "ARECORD_PID=$ARECORD_PID"; echo "FFMPEG_PID=$FFMPEG_PID"; echo "FIFO=$FIFO"; echo "AUDIO_FILE=$AUDIO_FILE"; echo "AUDIO_EXT=$AUDIO_EXT";
   } >>"$SESSION_FILE"
   echo "Started session: FILE=$FILE ARECORD_PID=$ARECORD_PID FFMPEG_PID=$FFMPEG_PID FIFO=$FIFO" &>>"$LOGFILE"
 
   # Wait for output wav file creation (notify only after present with data)
   for i in {1..80}; do
-    if [[ -f "${FILE}.wav" ]]; then
+    if [[ -f "$AUDIO_FILE" ]]; then
       echo "Output file created after $i * 0.1s" &>>"$LOGFILE"
       break
     fi
@@ -185,6 +209,7 @@ stop_recording_stream() {
   else
     echo "Pipeline stopped (arecord $ARECORD_PID, ffmpeg $FFMPEG_PID)." &>>"$LOGFILE"
   fi
+  ps xa | grep arecord | grep "$VOICE_TYPE_STATE_DIR" | awk '{system("kill "$1)}' || true
   # Cleanup FIFO
   [[ -n "$FIFO" && -p "$FIFO" ]] && rm -f "$FIFO" 2>/dev/null || true
 }
@@ -203,8 +228,9 @@ output_transcript() {
 
 transcribe_with_openai() {
   local src
-  src="${FILE}.wav"
+  src="$AUDIO_FILE"
   if [[ ! -f "$src" ]]; then echo "Audio file not found: $src" &>>"$LOGFILE"; return 1; fi
+  # OpenAI Whisper accepts mp3 or wav transparently
   curl --fail --request POST \
     --url https://api.openai.com/v1/audio/transcriptions \
     --header "Authorization: Bearer $OPEN_AI_TOKEN" \
@@ -218,13 +244,15 @@ transcribe_with_openai() {
 
 transcribe_with_deepgram() {
   local src
-  src="${FILE}.wav"
+  src="$AUDIO_FILE"
   if [[ ! -f "$src" ]]; then echo "Audio file not found: $src" &>>"$LOGFILE"; return 1; fi
   local DPARAMS="model=nova-3-general&smart_format=true&detect_language=ru&detect_language=en&detect_language=de"
+  local ctype
+  if [[ "$AUDIO_EXT" == "mp3" ]]; then ctype="audio/mpeg"; else ctype="audio/wav"; fi
   curl --fail --request POST \
     --url "https://api.deepgram.com/v1/listen?${DPARAMS}" \
     --header "Authorization: Token $DEEPGRAM_TOKEN" \
-    --header 'Content-Type: audio/wav' \
+    --header "Content-Type: $ctype" \
     --data-binary "@$src" \
     -o "${FILE}.json" &>>"$LOGFILE"
   echo "transcribe_with_deepgram: request finished (input $(basename "$src") output ${FILE}.json)" &>>"$LOGFILE"
@@ -261,8 +289,8 @@ main() {
       exit 1
     fi
     LOGFILE="${FILE}.log"
-    # If arecord already gone but wav exists treat as finalize
-    if [[ ! -d "/proc/${ARECORD_PID:-}" && ! -f "${FILE}.wav" ]]; then
+    # If arecord already gone but audio file not present treat as new
+    if [[ ! -d "/proc/${ARECORD_PID:-}" && ! -f "$AUDIO_FILE" ]]; then
       echo "Fallback: no arecord process and no audio file; starting new recording instead." &>>"$LOGFILE"
       cleanup_session
       start_recording_stream
@@ -277,11 +305,10 @@ main() {
     cleanup_session
   else
     start_recording_stream
-    # Notify only after file created
-    if [[ -f "${FILE}.wav" ]]; then
+    if [[ -f "$AUDIO_FILE" ]]; then
       notify "Recording started" "Trigger again to stop"
     else
-      notify "Recording starting" "Please wait..." # fallback if file not yet ready
+      notify "Recording starting" "Please wait..."
     fi
   fi
 }
