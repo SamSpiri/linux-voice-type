@@ -18,10 +18,9 @@ readonly DEFAULT_LOGFILE="${VOICE_TYPE_VAR_DIR}/voice-type.log"
 
 # Recording parameters (fixed simplified format)
 : "${VOICE_TYPE_DEVICE:=default}"           # ALSA device (arecord -D)
-: "${VOICE_TYPE_FORMAT_REC:=S32_LE}"        # arecord sample format
-: "${VOICE_TYPE_RATE_REC:=44100}"           # arecord sample rate Hz
-: "${VOICE_TYPE_FORMAT:=S16_LE}"            # ffmpeg sample format
-: "${VOICE_TYPE_RATE:=22000}"               # ffmpeg sample rate Hz (used for output / resample)
+: "${VOICE_TYPE_FORMAT_REC:=S32_LE}"        # arecord sample format (raw) - will be mapped for ffmpeg (-f)
+: "${VOICE_TYPE_RATE_REC:=44100}"           # arecord sample rate Hz (input)
+: "${VOICE_TYPE_RATE:=44100}"               # target/output sample rate Hz (resample if different)
 : "${VOICE_TYPE_CHANNELS:=1}"               # channels (mono)
 : "${VOICE_TYPE_MAX_DURATION:=3600}"        # safety cap seconds
 
@@ -122,12 +121,22 @@ sanity_check() {
   set -u
 }
 
+# Helper: map ALSA format string to ffmpeg raw format name
+ffmpeg_raw_format_from_arecord() {
+  case "${VOICE_TYPE_FORMAT_REC}" in
+    S32_LE) echo s32le ;;
+    S24_LE) echo s24le ;;
+    S16_LE) echo s16le ;;
+    F32_LE) echo f32le ;;
+    *) echo s16le ;; # safe default
+  esac
+}
+
 start_recording_stream() {
   ensure_state_dirs
   FILE="${VOICE_TYPE_VAR_DIR}/recording-$(date +%Y%m%d-%H%M%S)"
   LOGFILE="${FILE}.log"
   FIFO="${FILE}.pipe"
-  # derive extension + audio file
   if [[ "$VOICE_TYPE_AUDIO_CODEC" == "mp3" ]]; then AUDIO_EXT="mp3"; else AUDIO_EXT="wav"; fi
   AUDIO_FILE="${FILE}.${AUDIO_EXT}"
   mkfifo "$FIFO"
@@ -147,27 +156,30 @@ start_recording_stream() {
     filter_chain=(-af "$filters")
   fi
 
-  echo "start_recording_stream: device=$VOICE_TYPE_DEVICE format=$VOICE_TYPE_FORMAT_REC rate=$VOICE_TYPE_RATE_REC ch=$VOICE_TYPE_CHANNELS filter=${filter_chain} codec=$VOICE_TYPE_AUDIO_CODEC" &>>"$LOGFILE"
+  local ff_raw_format
+  ff_raw_format="$(ffmpeg_raw_format_from_arecord)"
+
+  echo "start_recording_stream: device=$VOICE_TYPE_DEVICE arecord_format=$VOICE_TYPE_FORMAT_REC ffmpeg_raw=$ff_raw_format in_rate=$VOICE_TYPE_RATE_REC out_rate=$VOICE_TYPE_RATE ch=$VOICE_TYPE_CHANNELS filters='${filters:-none}' codec=$VOICE_TYPE_AUDIO_CODEC" &>>"$LOGFILE"
 
   # Start arecord producer (raw format to FIFO)
   arecord -D "$VOICE_TYPE_DEVICE" -f "$VOICE_TYPE_FORMAT_REC" -r "$VOICE_TYPE_RATE_REC" -c "$VOICE_TYPE_CHANNELS" -t raw --duration "$VOICE_TYPE_MAX_DURATION" "$FIFO" &>>"$LOGFILE" 2>&1 &
   ARECORD_PID=$!
-  # Start ffmpeg consumer reading FIFO applying filters -> encoded output
+  # Start ffmpeg consumer. Input uses raw format & input rate; output optionally resamples if VOICE_TYPE_RATE differs.
+  local output_rate_args=()
+  if [[ "$VOICE_TYPE_RATE" != "$VOICE_TYPE_RATE_REC" ]]; then
+    output_rate_args=(-ar "$VOICE_TYPE_RATE")
+  fi
   if [[ "$VOICE_TYPE_AUDIO_CODEC" == "mp3" ]]; then
     ffmpeg -hide_banner -nostats -y \
-      -f "$VOICE_TYPE_FORMAT" \
-      -ar "$VOICE_TYPE_RATE" -ac "$VOICE_TYPE_CHANNELS" \
-      -i "$FIFO" \
+      -f "$ff_raw_format" -ar "$VOICE_TYPE_RATE_REC" -ac "$VOICE_TYPE_CHANNELS" -i "$FIFO" \
       "${filter_chain[@]}" \
-      -ac "$VOICE_TYPE_CHANNELS" -ar "$VOICE_TYPE_RATE" \
+      -ac "$VOICE_TYPE_CHANNELS" "${output_rate_args[@]}" \
       -c:a libmp3lame -b:a "$VOICE_TYPE_MP3_BITRATE" "$AUDIO_FILE" &>>"$LOGFILE" 2>&1 &
   else
     ffmpeg -hide_banner -nostats -y \
-      -f "$VOICE_TYPE_FORMAT" \
-      -ar "$VOICE_TYPE_RATE" -ac "$VOICE_TYPE_CHANNELS" \
-      -i "$FIFO" \
+      -f "$ff_raw_format" -ar "$VOICE_TYPE_RATE_REC" -ac "$VOICE_TYPE_CHANNELS" -i "$FIFO" \
       "${filter_chain[@]}" \
-      -ac "$VOICE_TYPE_CHANNELS" -ar "$VOICE_TYPE_RATE" \
+      -ac "$VOICE_TYPE_CHANNELS" "${output_rate_args[@]}" \
       -c:a pcm_s16le "$AUDIO_FILE" &>>"$LOGFILE" 2>&1 &
   fi
   FFMPEG_PID=$!
@@ -249,7 +261,7 @@ transcribe_with_deepgram() {
   local DPARAMS="model=nova-3-general&smart_format=true&detect_language=ru&detect_language=en&detect_language=de"
   local ctype
   if [[ "$AUDIO_EXT" == "mp3" ]]; then ctype="audio/mpeg"; else ctype="audio/wav"; fi
-  curl --fail --request POST \
+  echo curl --fail --request POST \
     --url "https://api.deepgram.com/v1/listen?${DPARAMS}" \
     --header "Authorization: Token $DEEPGRAM_TOKEN" \
     --header "Content-Type: $ctype" \
