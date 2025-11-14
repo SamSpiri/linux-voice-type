@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # usage: exec ./voice-typing.sh twice to start and stop recording
-# Dependencies: curl, jq, arecord, ffmpeg, xdotool, killall, flock, xclip, perl
+# Dependencies: curl, jq, arecord, ffmpeg, xdotool, killall, flock, xclip, perl, yad
 # Simplified streaming pipeline: arecord | ffmpeg (silence removal + loudnorm)
 
 set -euo pipefail
@@ -15,6 +15,10 @@ readonly VOICE_TYPE_VAR_DIR="${HOME}/.local/var/voice-type"
 readonly SESSION_FILE="${VOICE_TYPE_STATE_DIR}/session.env"
 readonly LOCK_FILE="${VOICE_TYPE_STATE_DIR}/lock"
 readonly DEFAULT_LOGFILE="${VOICE_TYPE_VAR_DIR}/voice-type.log"
+readonly TRAY_FIFO="${VOICE_TYPE_STATE_DIR}/tray.fifo"
+readonly TRAY_PID_FILE="${VOICE_TYPE_STATE_DIR}/tray.pid"
+
+KEEP_TRAY_ON_EXIT=0
 
 # Recording parameters (fixed simplified format)
 : "${VOICE_TYPE_DEVICE:=default}"           # ALSA device (arecord -D)
@@ -41,6 +45,7 @@ readonly DEFAULT_LOGFILE="${VOICE_TYPE_VAR_DIR}/voice-type.log"
 
 # Notifications
 : "${VOICE_TYPE_NO_NOTIFY:=0}"               # 1 disables notifications
+: "${VOICE_TYPE_TRAY_ICON:=1}"               # 1 enables tray icon (set 0 to disable)
 
 # Output encoding (added)
 : "${VOICE_TYPE_AUDIO_CODEC:=mp3}"          # target audio codec (mp3 for libmp3lame; wav for pcm_s16le)
@@ -63,6 +68,7 @@ LOGFILE="$DEFAULT_LOGFILE"
 LOCK_FD=0
 AUDIO_EXT=""          # derived extension based on codec
 AUDIO_FILE=""         # full path to audio file
+TRAY_PID=""           # PID of yad tray process
 
 #################################
 # Utility / infrastructure funcs #
@@ -81,46 +87,98 @@ ensure_state_dirs() {
   mkdir -p "$VOICE_TYPE_VAR_DIR" || true
 }
 
-acquire_lock() {
-  ensure_state_dirs
-  exec {LOCK_FD}>"$LOCK_FILE" || { echo "Failed to open lock file $LOCK_FILE" &>>"$LOGFILE"; return 1; }
-  if ! flock -n "$LOCK_FD"; then
-    echo "Lock busy: another voice-typing operation in progress." &>>"$LOGFILE"
-    notify "Voice typing busy" "Another operation is in progress"
-    return 1
+#################################
+# Tray icon management functions #
+#################################
+start_tray_icon() {
+  if [[ "$VOICE_TYPE_TRAY_ICON" != "1" ]]; then return 0; fi
+  if ! command -v yad &>/dev/null; then
+    echo "yad not found; tray icon disabled" &>>"$LOGFILE"
+    return 0
   fi
-  { echo "PID=$$"; echo "TIME=$(date -Is)"; echo "ACTION_PENDING=$( [[ -f $SESSION_FILE ]] && echo stop || echo start )"; } >"$LOCK_FILE" 2>/dev/null || true
-  echo "acquire_lock: obtained lock (action=$( [[ -f $SESSION_FILE ]] && echo stop || echo start ))" &>>"$LOGFILE"
+
+  # Clean up any existing tray
+  stop_tray_icon 2>/dev/null || true
+
+  # Create FIFO for communication
+  rm -f "$TRAY_FIFO" 2>/dev/null || true
+  mkfifo "$TRAY_FIFO" 2>/dev/null || true
+
+  # Start yad notification icon in background
+  yad --notification \
+    --listen \
+    --image="audio-input-microphone" \
+    --text="Voice Typing: Idle" \
+    --no-middle \
+    --command="" \
+    <"$TRAY_FIFO" &>/dev/null &
+
+  TRAY_PID=$!
+  echo "$TRAY_PID" > "$TRAY_PID_FILE"
+
+  echo "start_tray_icon: started yad tray (PID=$TRAY_PID)" &>>"$LOGFILE"
+
+  # Keep FIFO open for writing
+  exec 3>"$TRAY_FIFO"
 }
 
-release_lock() {
-  if (( LOCK_FD > 0 )); then
-    flock -u "$LOCK_FD" 2>/dev/null || true
-    exec {LOCK_FD}>&- 2>/dev/null || true
-    rm -f "$LOCK_FILE" 2>/dev/null || true
-    echo "release_lock: released lock" &>>"$LOGFILE"
-  fi
-}
+stop_tray_icon() {
+  if [[ "$VOICE_TYPE_TRAY_ICON" != "1" ]]; then return 0; fi
+  if [[ "$KEEP_TRAY_ON_EXIT" != "0" ]]; then return 0; fi
 
-sanity_check() {
-  for cmd in xdotool arecord ffmpeg jq curl timeout flock xclip perl; do
-    if ! command -v "$cmd" &>/dev/null; then
-      echo >&2 "Error: command $cmd not found."
-      echo "Error: command $cmd not found." &>>"$LOGFILE"
-      notify "Missing dependency" "$cmd not found"
-      exit 1
+  # Close FIFO descriptor if open
+  exec 3>&- 2>/dev/null || true
+
+  # Kill yad process
+  if [[ -f "$TRAY_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$TRAY_PID_FILE" 2>/dev/null || echo "")
+    if [[ -n "$pid" ]] && [[ -d "/proc/$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      echo "stop_tray_icon: killed yad tray (PID=$pid)" &>>"$LOGFILE"
     fi
-  done
-  set +u
-  if [[ -z "${DEEPGRAM_TOKEN:-}" && -z "${OPEN_AI_TOKEN:-}" ]]; then
-    echo >&2 "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable."
-    echo "You must set the DEEPGRAM_TOKEN or OPEN_AI_TOKEN environment variable." &>>"$LOGFILE"
-    notify "Voice typing error" "Missing API token"
-    exit 1
+    rm -f "$TRAY_PID_FILE" 2>/dev/null || true
   fi
-  set -u
+
+  # Cleanup FIFO
+  rm -f "$TRAY_FIFO" 2>/dev/null || true
 }
 
+update_tray_icon() {
+  if [[ "$VOICE_TYPE_TRAY_ICON" != "1" ]]; then return 0; fi
+  if [[ ! -p "$TRAY_FIFO" ]]; then return 0; fi
+
+  local state="$1"
+  local icon tooltip
+
+  case "$state" in
+    recording)
+      icon="media-record"
+      tooltip="Voice Typing: Recording..."
+      ;;
+    processing)
+      icon="emblem-synchronizing"
+      tooltip="Voice Typing: Processing..."
+      ;;
+    error)
+      icon="dialog-error"
+      tooltip="Voice Typing: Error"
+      ;;
+    idle|*)
+      icon="audio-input-microphone"
+      tooltip="Voice Typing: Idle"
+      ;;
+  esac
+
+  echo "icon:$icon" >&3 2>/dev/null || true
+  echo "tooltip:$tooltip" >&3 2>/dev/null || true
+
+  echo "update_tray_icon: state=$state icon=$icon" &>>"$LOGFILE"
+}
+
+#################################
+# Recording functions           #
+#################################
 # Helper: map ALSA format string to ffmpeg raw format name
 ffmpeg_raw_format_from_arecord() {
   case "${VOICE_TYPE_FORMAT_REC}" in
@@ -158,6 +216,8 @@ start_recording_stream() {
 
   local ff_raw_format
   ff_raw_format="$(ffmpeg_raw_format_from_arecord)"
+
+  update_tray_icon "processing"
 
   echo "start_recording_stream: device=$VOICE_TYPE_DEVICE arecord_format=$VOICE_TYPE_FORMAT_REC ffmpeg_raw=$ff_raw_format in_rate=$VOICE_TYPE_RATE_REC out_rate=$VOICE_TYPE_RATE ch=$VOICE_TYPE_CHANNELS filters='${filters:-none}' codec=$VOICE_TYPE_AUDIO_CODEC" &>>"$LOGFILE"
 
@@ -199,10 +259,14 @@ start_recording_stream() {
     fi
     sleep 0.1
   done
+
+  # Update tray to recording state
+  update_tray_icon "recording"
 }
 
 stop_recording_stream() {
   echo "stop_recording_stream: stopping (ARECORD_PID=${ARECORD_PID:-} FFMPEG_PID=${FFMPEG_PID:-})" &>>"$LOGFILE"
+  update_tray_icon "processing"
   if [[ -z "${ARECORD_PID:-}" ]]; then echo "No ARECORD_PID in session; abort" &>>"$LOGFILE"; return 0; fi
   if [[ -d "/proc/$ARECORD_PID" ]]; then
     kill "$ARECORD_PID" 2>/dev/null || true
@@ -241,7 +305,11 @@ output_transcript() {
 transcribe_with_openai() {
   local src
   src="$AUDIO_FILE"
-  if [[ ! -f "$src" ]]; then echo "Audio file not found: $src" &>>"$LOGFILE"; return 1; fi
+  if [[ ! -f "$src" ]]; then
+    echo "Audio file not found: $src" &>>"$LOGFILE"
+    update_tray_icon "error"
+    return 1
+  fi
   # OpenAI Whisper accepts mp3 or wav transparently
   curl --fail --request POST \
     --url https://api.openai.com/v1/audio/transcriptions \
@@ -257,11 +325,15 @@ transcribe_with_openai() {
 transcribe_with_deepgram() {
   local src
   src="$AUDIO_FILE"
-  if [[ ! -f "$src" ]]; then echo "Audio file not found: $src" &>>"$LOGFILE"; return 1; fi
+  if [[ ! -f "$src" ]]; then
+    echo "Audio file not found: $src" &>>"$LOGFILE"
+    update_tray_icon "error"
+    return 1
+  fi
   local DPARAMS="model=nova-3-general&smart_format=true&detect_language=ru&detect_language=en&detect_language=de"
   local ctype
   if [[ "$AUDIO_EXT" == "mp3" ]]; then ctype="audio/mpeg"; else ctype="audio/wav"; fi
-  curl --fail --request POST \
+  echo curl --fail --request POST \
     --url "https://api.deepgram.com/v1/listen?${DPARAMS}" \
     --header "Authorization: Token $DEEPGRAM_TOKEN" \
     --header "Content-Type: $ctype" \
@@ -276,7 +348,11 @@ transcribe_with_deepgram() {
 
 transcript() {
   set +u
-  if [[ -z "${DEEPGRAM_TOKEN:-}" ]]; then transcribe_with_openai || true; else transcribe_with_deepgram || true; fi
+  if [[ -z "${DEEPGRAM_TOKEN:-}" ]]; then
+    transcribe_with_openai || { update_tray_icon "error"; return 1; }
+  else
+    transcribe_with_deepgram || { update_tray_icon "error"; return 1; }
+  fi
   set -u
 }
 
@@ -287,9 +363,17 @@ cleanup_session() {
 
 main() {
   ensure_state_dirs
-  sanity_check
-  if ! acquire_lock; then exit 1; fi
-  trap release_lock EXIT
+  #sanity_check
+  #if ! acquire_lock; then exit 1; fi
+  #trap 'release_lock; stop_tray_icon' EXIT
+  trap 'stop_tray_icon' EXIT
+
+  # Start tray icon if not already running
+  if [[ ! -f "$TRAY_PID_FILE" ]] || ! kill -0 "$(cat "$TRAY_PID_FILE" 2>/dev/null)" 2>/dev/null; then
+    start_tray_icon
+    update_tray_icon "idle"
+  fi
+
   if [[ -f "$SESSION_FILE" ]]; then
     # Stop phase
     # shellcheck source=/dev/null
@@ -298,6 +382,7 @@ main() {
       echo "Session file missing FILE variable; aborting." &>>"$LOGFILE"
       cleanup_session
       notify "Voice typing error" "Session corrupt"
+      update_tray_icon "error"
       exit 1
     fi
     LOGFILE="${FILE}.log"
@@ -312,9 +397,10 @@ main() {
 
     notify "Stopping recording" "Avoid using clipboard"
     stop_recording_stream || true
-    transcript || true
+    transcript || { update_tray_icon "error"; }
     output_transcript || true
     cleanup_session
+    update_tray_icon "idle"
   else
     start_recording_stream
     if [[ -f "$AUDIO_FILE" ]]; then
@@ -322,6 +408,7 @@ main() {
     else
       notify "Recording starting" "Please wait..."
     fi
+    KEEP_TRAY_ON_EXIT=1
   fi
 }
 
