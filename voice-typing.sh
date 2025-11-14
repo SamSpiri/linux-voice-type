@@ -44,7 +44,7 @@ KEEP_TRAY_ON_EXIT=0
 : "${VOICE_TYPE_LOUDNORM_LINEAR:=false}"     # linear=false
 
 # Notifications
-: "${VOICE_TYPE_NO_NOTIFY:=0}"               # 1 disables notifications
+: "${VOICE_TYPE_VERBOSE_NOTIFY:=0}"               # 1 disables notifications
 : "${VOICE_TYPE_TRAY_ICON:=1}"               # 1 enables tray icon (set 0 to disable)
 
 # Output encoding (added)
@@ -74,7 +74,9 @@ TRAY_PID=""           # PID of yad tray process
 # Utility / infrastructure funcs #
 #################################
 notify() {
-  if [[ "$VOICE_TYPE_NO_NOTIFY" == "1" ]]; then return 0; fi
+  if [[ "${3:-}" != "force" ]]; then
+    if [[ "$VOICE_TYPE_VERBOSE_NOTIFY" == "0" ]]; then return 0; fi
+  fi
   if command -v notify-send &>/dev/null; then
     local title="$1" body="${2:-}"
     notify-send --app-name="VoiceType" --icon=audio-input-microphone "$title" "$body" || true
@@ -98,7 +100,7 @@ start_tray_icon() {
   fi
 
   # Clean up any existing tray
-  stop_tray_icon 2>/dev/null || true
+  stop_tray_icon nosleep 2>/dev/null || true
 
   # Create FIFO for communication
   rm -f "$TRAY_FIFO" 2>/dev/null || true
@@ -109,7 +111,6 @@ start_tray_icon() {
     --listen \
     --image="audio-input-microphone" \
     --text="Voice Typing: Idle" \
-    --no-middle \
     --command="" \
     <"$TRAY_FIFO" &>/dev/null &
 
@@ -117,14 +118,13 @@ start_tray_icon() {
   echo "$TRAY_PID" > "$TRAY_PID_FILE"
 
   echo "start_tray_icon: started yad tray (PID=$TRAY_PID)" &>>"$LOGFILE"
-
-  # Keep FIFO open for writing
-  exec 3>"$TRAY_FIFO"
 }
 
 stop_tray_icon() {
   if [[ "$VOICE_TYPE_TRAY_ICON" != "1" ]]; then return 0; fi
   if [[ "$KEEP_TRAY_ON_EXIT" != "0" ]]; then return 0; fi
+
+  [[ "${1:-sleep}" == "sleep" ]] && sleep 5
 
   # Close FIFO descriptor if open
   exec 3>&- 2>/dev/null || true
@@ -147,6 +147,8 @@ stop_tray_icon() {
 update_tray_icon() {
   if [[ "$VOICE_TYPE_TRAY_ICON" != "1" ]]; then return 0; fi
   if [[ ! -p "$TRAY_FIFO" ]]; then return 0; fi
+  # check if internal fd 3 is open; if not, open it
+  [[ ! -e /proc/$$/fd/3 ]] && exec 3>"$TRAY_FIFO"
 
   local state="$1"
   local icon tooltip
@@ -160,8 +162,12 @@ update_tray_icon() {
       icon="emblem-synchronizing"
       tooltip="Voice Typing: Processing..."
       ;;
+    done)
+      icon="emblem-default"
+      tooltip="Voice Typing: Done."
+      ;;
     error)
-      icon="dialog-error"
+      icon="emblem-dropbox-unsyncable"
       tooltip="Voice Typing: Error"
       ;;
     idle|*)
@@ -295,10 +301,12 @@ output_transcript() {
     perl -pi -e 'chomp if eof' "$FILE.txt" 2>/dev/null || true
     xclip -selection clipboard < "$FILE.txt" &>>"$LOGFILE" || true
     echo "Transcript copied to clipboard: $FILE.txt" &>>"$LOGFILE"
-    notify "Transcription ready" "CTRL-V"
+    notify "Transcription ready" "CTRL-V" "force"
+    update_tray_icon "done"
   else
     echo "Transcript file missing: $FILE.txt" &>>"$LOGFILE"
-    notify "Transcription failed" "Transcript missing"
+    notify "Transcription failed" "Transcript missing" "force"
+    update_tray_icon "error"
   fi
 }
 
@@ -333,7 +341,7 @@ transcribe_with_deepgram() {
   local DPARAMS="model=nova-3-general&smart_format=true&detect_language=ru&detect_language=en&detect_language=de"
   local ctype
   if [[ "$AUDIO_EXT" == "mp3" ]]; then ctype="audio/mpeg"; else ctype="audio/wav"; fi
-  echo curl --fail --request POST \
+  curl --fail --request POST \
     --url "https://api.deepgram.com/v1/listen?${DPARAMS}" \
     --header "Authorization: Token $DEEPGRAM_TOKEN" \
     --header "Content-Type: $ctype" \
@@ -371,7 +379,6 @@ main() {
   # Start tray icon if not already running
   if [[ ! -f "$TRAY_PID_FILE" ]] || ! kill -0 "$(cat "$TRAY_PID_FILE" 2>/dev/null)" 2>/dev/null; then
     start_tray_icon
-    update_tray_icon "idle"
   fi
 
   if [[ -f "$SESSION_FILE" ]]; then
@@ -381,7 +388,7 @@ main() {
     if [[ -z "${FILE:-}" ]]; then
       echo "Session file missing FILE variable; aborting." &>>"$LOGFILE"
       cleanup_session
-      notify "Voice typing error" "Session corrupt"
+      notify "Voice typing error" "Session corrupt" "force"
       update_tray_icon "error"
       exit 1
     fi
@@ -400,7 +407,6 @@ main() {
     transcript || { update_tray_icon "error"; }
     output_transcript || true
     cleanup_session
-    update_tray_icon "idle"
   else
     start_recording_stream
     if [[ -f "$AUDIO_FILE" ]]; then
