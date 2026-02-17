@@ -28,6 +28,11 @@ KEEP_TRAY_ON_EXIT=0
 : "${VOICE_TYPE_CHANNELS:=1}"               # channels (mono)
 : "${VOICE_TYPE_MAX_DURATION:=3600}"        # safety cap seconds
 
+# Preflight mic check (detect muted / no audio early)
+: "${VOICE_TYPE_PREFLIGHT_ENABLE:=1}"        # 1 enables short level check before recording
+: "${VOICE_TYPE_PREFLIGHT_SECONDS:=1}"     # duration of preflight capture in seconds
+: "${VOICE_TYPE_PREFLIGHT_MIN_DBFS:=-55}"    # if max volume is below this, treat as muted/no input
+
 # Silence removal defaults (from experimental command)
 : "${VOICE_TYPE_SILENCE_ENABLE:=1}"          # set 0 to disable silenceremove
 : "${VOICE_TYPE_SILENCE_THRESHOLD_DB:=54}"   # numeric dB value (will be used as -${value}dB)
@@ -124,7 +129,7 @@ stop_tray_icon() {
   if [[ "$VOICE_TYPE_TRAY_ICON" != "1" ]]; then return 0; fi
   if [[ "$KEEP_TRAY_ON_EXIT" != "0" ]]; then return 0; fi
 
-  [[ "${1:-sleep}" == "sleep" ]] && sleep 5
+  [[ "${1:-sleep}" == "sleep" ]] && sleep 0.5
 
   # Close FIFO descriptor if open
   exec 3>&- 2>/dev/null || true
@@ -196,10 +201,63 @@ ffmpeg_raw_format_from_arecord() {
   esac
 }
 
+preflight_mic_check() {
+  # Returns 0 if signal is present, 1 if muted/no input (or check failed).
+  if [[ "${VOICE_TYPE_PREFLIGHT_ENABLE}" != "1" ]]; then
+    return 0
+  fi
+
+  local ff_raw_format
+  ff_raw_format="$(ffmpeg_raw_format_from_arecord)"
+
+  echo "preflight_mic_check: seconds=${VOICE_TYPE_PREFLIGHT_SECONDS} min_dbfs=${VOICE_TYPE_PREFLIGHT_MIN_DBFS} device=${VOICE_TYPE_DEVICE} format=${VOICE_TYPE_FORMAT_REC} rate=${VOICE_TYPE_RATE_REC} ch=${VOICE_TYPE_CHANNELS}" &>>"$LOGFILE"
+
+  # Capture a short raw sample and run volumedetect to get max_volume.
+  # If mic is muted, volumedetect typically reports max_volume: -inf dB.
+  local vd_out max_db
+  set +e
+  vd_out=$(
+    arecord -D "$VOICE_TYPE_DEVICE" -f "$VOICE_TYPE_FORMAT_REC" -r "$VOICE_TYPE_RATE_REC" -c "$VOICE_TYPE_CHANNELS" \
+      -t raw -d "$VOICE_TYPE_PREFLIGHT_SECONDS" - 2>>"$LOGFILE" \
+      | ffmpeg -hide_banner -nostats -v info \
+          -f "$ff_raw_format" -ar "$VOICE_TYPE_RATE_REC" -ac "$VOICE_TYPE_CHANNELS" -i - \
+          -af volumedetect -f null - 2>&1
+  )
+  set -e
+
+  # echo "$vd_out" &>>"$LOGFILE"
+
+  # Extract last max_volume value (handles multiple lines).
+  max_db=$(awk -F': ' '/max_volume:/{v=$2} END{gsub(/ dB.*/,"",v); print v}' <<<"$vd_out")
+  echo "preflight_mic_check: volumedetect max_volume='${max_db:-}'" &>>"$LOGFILE"
+
+  if [[ -z "${max_db:-}" ]]; then
+    echo "preflight_mic_check: failed to parse volumedetect output" &>>"$LOGFILE"
+    return 1
+  fi
+  if [[ "$max_db" == "-inf" ]]; then
+    return 1
+  fi
+  # Float compare: if max_db < min_dbfs => fail.
+  if awk -v a="$max_db" -v b="$VOICE_TYPE_PREFLIGHT_MIN_DBFS" 'BEGIN{exit (a+0 < b+0) ? 0 : 1}'; then
+    return 1
+  fi
+  return 0
+}
+
 start_recording_stream() {
   ensure_state_dirs
   FILE="${VOICE_TYPE_VAR_DIR}/recording-$(date +%Y%m%d-%H%M%S)"
   LOGFILE="${FILE}.log"
+
+  update_tray_icon "processing"
+  if ! preflight_mic_check; then
+    echo "start_recording_stream: preflight failed (muted/no input suspected)" &>>"$LOGFILE"
+    notify "Microphone muted?" "No audio detected. Unmute mic and try again." "force"
+    update_tray_icon "error"
+    return 1
+  fi
+
   FIFO="${FILE}.pipe"
   if [[ "$VOICE_TYPE_AUDIO_CODEC" == "mp3" ]]; then AUDIO_EXT="mp3"; else AUDIO_EXT="wav"; fi
   AUDIO_FILE="${FILE}.${AUDIO_EXT}"
@@ -222,8 +280,6 @@ start_recording_stream() {
 
   local ff_raw_format
   ff_raw_format="$(ffmpeg_raw_format_from_arecord)"
-
-  update_tray_icon "processing"
 
   echo "start_recording_stream: device=$VOICE_TYPE_DEVICE arecord_format=$VOICE_TYPE_FORMAT_REC ffmpeg_raw=$ff_raw_format in_rate=$VOICE_TYPE_RATE_REC out_rate=$VOICE_TYPE_RATE ch=$VOICE_TYPE_CHANNELS filters='${filters:-none}' codec=$VOICE_TYPE_AUDIO_CODEC" &>>"$LOGFILE"
 
